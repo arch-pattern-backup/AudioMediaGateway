@@ -12,6 +12,15 @@ class ConfigManager:
             try:
                 with open(self.config_file, 'r') as f:
                     self.config = json.load(f)
+                
+                # S3 Defaults
+                if "storage_type" not in self.config: self.config["storage_type"] = "local"
+                if "s3_endpoint" not in self.config: self.config["s3_endpoint"] = ""
+                if "s3_bucket" not in self.config: self.config["s3_bucket"] = ""
+                if "s3_region" not in self.config: self.config["s3_region"] = ""
+                if "s3_access_key" not in self.config: self.config["s3_access_key"] = ""
+                if "s3_secret_key" not in self.config: self.config["s3_secret_key"] = ""
+                if "s3_path_prefix" not in self.config: self.config["s3_path_prefix"] = ""
             except:
                 self.config = {}
         else:

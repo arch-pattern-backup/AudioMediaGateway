@@ -8,6 +8,7 @@ from library_tab import LibraryTab
 from player_widget import PlayerWidget
 from downloader_tab import DownloaderTab
 from config_manager import ConfigManager
+from theme_manager import ThemeManager
 
 sys.setrecursionlimit(5000) # Workaround for Tkinter recursion issue
 
@@ -47,7 +48,13 @@ class SunoSyncApp(tk.Tk):
         try:
             icon_path = resource_path("resources/icon.ico")
             if os.path.exists(icon_path):
-                self.iconbitmap(icon_path)
+                try:
+                    self.iconbitmap(icon_path)
+                except Exception:
+                    # Fallback for Linux/others that might fail with .ico bitmap
+                    img = Image.open(icon_path)
+                    photo = ImageTk.PhotoImage(img)
+                    self.wm_iconphoto(True, photo)
         except Exception as e:
             print(f"Icon error: {e}")
 
@@ -55,7 +62,8 @@ class SunoSyncApp(tk.Tk):
         self.load_window_state()
         
         # Theme colors
-        self.bg_dark = "#1a1a1a"
+        self.theme_manager = ThemeManager()
+        self.bg_dark = self.theme_manager.bg_dark
         self.configure(bg=self.bg_dark)
         
         # Ensure minimum window size
@@ -65,7 +73,10 @@ class SunoSyncApp(tk.Tk):
         self.withdraw()
         
         # Make window borderless (remove title bar)
-        self.overrideredirect(True)
+        if sys.platform == "win32":
+            self.overrideredirect(True)
+        else:
+            self.overrideredirect(False)
         
         # Add window drag and close functionality
         self._setup_window_drag()
@@ -147,6 +158,11 @@ class SunoSyncApp(tk.Tk):
         # Show the window
         self.deiconify()
         self.update_idletasks()
+        
+        try:
+            self.wait_visibility(self)
+        except:
+            pass
         self.lift()
         self.focus_force()
         
@@ -245,20 +261,7 @@ class SunoSyncApp(tk.Tk):
         
         if last_version != current_version:
             # Show Changelog
-            messagebox.showinfo("What's New in v2.0", 
-                "🎉 Welcome to SunoSync v2.0! 🎉\n\n"
-                "✨ New Features:\n"
-                "• Sleek Borderless Design: Modern, professional windowless interface\n"
-                "• Enhanced Debug Log: Built-in debug viewer with save-to-file support\n"
-                "• Improved Stop Button: Now properly stops preload and download operations\n"
-                "• Better Error Handling: More detailed error messages and logging\n"
-                "• Fixed Player Sizing: Audio player now displays at proper height\n\n"
-                "🔧 Improvements:\n"
-                "• Preload functionality now works reliably\n"
-                "• Stop button allows restarting operations\n"
-                "• Better splash screen timing\n"
-                "• Improved UI layout and spacing\n\n"
-                "Enjoy your music!")
+            self.show_changelog_overlay()
             
             # Save new version
             data["version"] = current_version
@@ -267,6 +270,61 @@ class SunoSyncApp(tk.Tk):
                     json.dump(data, f)
             except:
                 pass
+
+    def show_changelog_overlay(self):
+        """Show changelog as an overlay frame."""
+        overlay = tk.Frame(self, bg="#121212")
+        overlay.place(relx=0, rely=0, relwidth=1, relheight=1)
+        overlay.lift()
+        overlay.focus_set()
+        try:
+            overlay.grab_set()
+        except: pass
+        
+        # Center card
+        card = tk.Frame(overlay, bg="#1E1E1E", padx=30, pady=30, highlightbackground="#333333", highlightthickness=1)
+        card.place(relx=0.5, rely=0.5, anchor="center")
+        
+        # Title
+        tk.Label(card, text="What's New in v2.0", font=("Segoe UI", 16, "bold"), 
+                 bg="#1E1E1E", fg="#E0E0E0").pack(pady=(0, 20))
+        
+        # Content
+        msg = (
+            "🎉 Welcome to SunoSync v2.0! 🎉\n\n"
+            "✨ New Features:\n"
+            "• Sleek Borderless Design\n"
+            "• Enhanced Debug Log\n"
+            "• Improved Stop Button\n"
+            "• Better Error Handling\n\n"
+            "🔧 Improvements:\n"
+            "• Preload functionality\n"
+            "• UI layout and spacing"
+        )
+        tk.Label(card, text=msg, font=("Segoe UI", 10), justify="left",
+                 bg="#1E1E1E", fg="#A0A0A0").pack(pady=(0, 25))
+        
+        def close_overlay(event=None):
+            try:
+                overlay.grab_release()
+            except:
+                pass
+            overlay.destroy()
+            try:
+                self.unbind("<Escape>")
+            except:
+                pass
+
+        # Button
+        btn = tk.Button(card, text="Get Started", command=close_overlay,
+                 bg="#8B5CF6", fg="white", font=("Segoe UI", 10, "bold"),
+                 relief="flat", padx=20, pady=8, cursor="hand2")
+        btn.pack()
+        btn.bind("<Button-1>", close_overlay)
+        btn.focus_set()
+        
+        # Allow closing with Escape key
+        self.bind("<Escape>", close_overlay)
 
     def load_window_state(self):
         try:
@@ -315,6 +373,9 @@ class SunoSyncApp(tk.Tk):
     
     def _setup_window_drag(self):
         """Setup window dragging and close button for borderless window."""
+        if sys.platform != "win32":
+            return
+            
         # Variables for dragging
         self._drag_start_x = 0
         self._drag_start_y = 0

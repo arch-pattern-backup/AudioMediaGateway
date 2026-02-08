@@ -195,6 +195,16 @@ class DownloaderTab(tk.Frame):
 
     def create_widgets(self):
         self.log_font_size_var = tk.IntVar(value=12)
+        
+        # Initialize S3 variables needed for settings card
+        c = self.config_manager
+        self.storage_type_var = tk.StringVar(value=c.get("storage_type", "local"))
+        self.s3_endpoint_var = tk.StringVar(value=c.get("s3_endpoint", ""))
+        self.s3_bucket_var = tk.StringVar(value=c.get("s3_bucket", ""))
+        self.s3_region_var = tk.StringVar(value=c.get("s3_region", ""))
+        self.s3_access_key_var = tk.StringVar(value=c.get("s3_access_key", ""))
+        self.s3_secret_key_var = tk.StringVar(value=c.get("s3_secret_key", ""))
+        self.s3_path_prefix_var = tk.StringVar(value=c.get("s3_path_prefix", ""))
 
         # Main Container (2-Column Grid)
         self.columnconfigure(0, weight=0, minsize=400) # Left Column (Fixed/Min width)
@@ -566,7 +576,6 @@ class DownloaderTab(tk.Frame):
     def load_config_into_ui(self):
         c = self.config_manager
         self.token_var.set(c.get("token", ""))
-        self.token_var.set(c.get("token", ""))
         self.path_var.set(c.get("path", ""))
         self.embed_thumb_var.set(c.get("embed_metadata", True))
         self.organize_var.set(c.get("organize", False))
@@ -596,18 +605,45 @@ class DownloaderTab(tk.Frame):
         })
         self._update_filter_btn_text()
         
+        # S3 Config (Variables are already initialized in create_widgets)
+        self.storage_type_var.set(c.get("storage_type", "local"))
+        self.s3_endpoint_var.set(c.get("s3_endpoint", ""))
+        self.s3_bucket_var.set(c.get("s3_bucket", ""))
+        self.s3_region_var.set(c.get("s3_region", ""))
+        self.s3_access_key_var.set(c.get("s3_access_key", ""))
+        self.s3_secret_key_var.set(c.get("s3_secret_key", ""))
+        self.s3_path_prefix_var.set(c.get("s3_path_prefix", ""))
+
         # Bind traces for real-time summary updates
         self.token_var.trace_add("write", self.update_accordion_summaries)
         self.download_wav_var.trace_add("write", self.update_accordion_summaries)
         self.embed_thumb_var.trace_add("write", self.update_accordion_summaries)
         self.organize_var.trace_add("write", self.update_accordion_summaries)
-        self.organize_var.trace_add("write", self.update_accordion_summaries)
         self.track_folder_var.trace_add("write", self.update_accordion_summaries)
         self.smart_resume_var.trace_add("write", self.update_accordion_summaries)
-        
+        self.storage_type_var.trace_add("write", self.update_accordion_summaries)
+        self.storage_type_var.trace_add("write", self._update_storage_ui_visibility)
+
         # Add trace for disable sounds to apply immediately
         if hasattr(self, 'disable_sounds_var'):
             self.disable_sounds_var.trace_add("write", lambda *args: (self._apply_sound_setting(), self.save_config()))
+            
+        # Initial visibility update
+        self.after(100, self._update_storage_ui_visibility)
+
+    def _update_storage_ui_visibility(self, *args):
+        """Toggle visibility of storage settings based on type."""
+        if not hasattr(self, 's3_settings_frame'):
+            return
+            
+        if self.storage_type_var.get() == "s3":
+            self.s3_settings_frame.pack(fill="x", padx=12, pady=(0, 12))
+        else:
+            self.s3_settings_frame.pack_forget()
+            
+        # Force settings card to resize
+        if hasattr(self, 'settings_card'):
+            self.after(50, lambda: self.settings_card._adjust_size())
 
     def update_accordion_summaries(self, *args):
         """Update the summary chips on accordion headers."""
@@ -620,6 +656,12 @@ class DownloaderTab(tk.Frame):
             
         # 2. Settings Summary
         settings_summary = []
+        
+        if self.storage_type_var.get() == "s3":
+            settings_summary.append("S3")
+        else:
+            settings_summary.append("Local")
+
         if self.download_wav_var.get():
             settings_summary.append("WAV")
         else:
@@ -657,6 +699,15 @@ class DownloaderTab(tk.Frame):
         c.set("smart_resume", self.smart_resume_var.get())
         c.set("filter_settings", self.filter_settings)
         
+        # S3 Config
+        c.set("storage_type", self.storage_type_var.get())
+        c.set("s3_endpoint", self.s3_endpoint_var.get())
+        c.set("s3_bucket", self.s3_bucket_var.get())
+        c.set("s3_region", self.s3_region_var.get())
+        c.set("s3_access_key", self.s3_access_key_var.get())
+        c.set("s3_secret_key", self.s3_secret_key_var.get())
+        c.set("s3_path_prefix", self.s3_path_prefix_var.get())
+        
         # Save disable sounds setting
         if hasattr(self, 'disable_sounds_var'):
             c.set("disable_sounds", self.disable_sounds_var.get())
@@ -691,9 +742,11 @@ class DownloaderTab(tk.Frame):
         if new_filters.pop("clear_workspace", False):
             self.filter_settings["workspace_id"] = None
             self.filter_settings["workspace_name"] = None
-            self.filter_settings["type"] = "all" # Reset to all or keep previous? Usually reset.
+            self.filter_settings["is_playlist"] = False
             if hasattr(self, 'workspace_btn'):
                 self.workspace_btn.set_text("Workspaces")
+            if hasattr(self, 'playlist_btn'):
+                self.playlist_btn.set_text("Playlists")
             messagebox.showinfo("Workspace Cleared", "Workspace selection has been cleared.")
         
         self.filter_settings.update(new_filters)
@@ -712,7 +765,9 @@ class DownloaderTab(tk.Frame):
         """Thread-safe logging via queue."""
         # For compatibility, we still accept logs but we might not show them all in the queue
         # unless they are relevant. For now, we rely on the specific song signals.
-        pass
+        if message:
+            msg = f"[{tag}] {message}" if tag else message
+            self.after(0, lambda: self.add_debug_log(msg))
 
     def log(self, message, tag=None, thumbnail_data=None):
         """Alias for log_safe for compatibility."""
@@ -809,12 +864,14 @@ class DownloaderTab(tk.Frame):
         name = ws.get("name")
         self.filter_settings["workspace_id"] = ws_id
         self.filter_settings["workspace_name"] = name
-        self.filter_settings["type"] = "workspace" # Custom type to indicate workspace mode if needed
+        self.filter_settings["is_playlist"] = False
         self.save_config()
         
         # Update UI to show selected workspace
         if hasattr(self, 'workspace_btn'):
             self.workspace_btn.set_text(f"WS: {name[:10]}...")
+        if hasattr(self, 'playlist_btn'):
+            self.playlist_btn.set_text("Playlists")
         
         messagebox.showinfo("Workspace Selected", f"Selected workspace: {name}\nClick 'Start Download' or 'Preload' to proceed.")
 
@@ -845,19 +902,15 @@ class DownloaderTab(tk.Frame):
         name = pl.get("name") or pl.get("title")
         self.filter_settings["workspace_id"] = pl_id # We reuse workspace_id as it's just an ID passed to API
         self.filter_settings["workspace_name"] = name
-        self.filter_settings["type"] = "playlist" # Custom type
-        
-        # Note: The downloader needs to know if it's a playlist or workspace to use correct URL?
-        # Actually, in suno_downloader.py, we need to handle "playlist" type if the API endpoint is different.
-        # Currently suno_downloader uses /api/project/{id} for workspace_id.
-        # If playlists use /api/playlist/{id}, we need to update suno_downloader.py.
-        # Let's check suno_downloader.py logic.
+        self.filter_settings["is_playlist"] = True
         
         self.save_config()
         
         # Update UI
         if hasattr(self, 'playlist_btn'):
             self.playlist_btn.set_text(f"PL: {name[:10]}...")
+        if hasattr(self, 'workspace_btn'):
+            self.workspace_btn.set_text("Workspaces")
         
         messagebox.showinfo("Playlist Selected", f"Selected playlist: {name}\nClick 'Start Download' or 'Preload' to proceed.")
 
@@ -1041,11 +1094,61 @@ class DownloaderTab(tk.Frame):
 
 
 
+    def start_migration_thread(self):
+        """Start the migration process in a separate thread."""
+        local_dir = self.path_var.get()
+        if not local_dir or not os.path.exists(local_dir):
+            messagebox.showerror("Error", "Local download folder is invalid or does not exist.")
+            return
+
+        # Ensure config is saved first
+        self.save_config()
+        c = self.config_manager
+        s3_config = {
+            "endpoint": c.get("s3_endpoint"),
+            "bucket": c.get("s3_bucket"),
+            "access_key": c.get("s3_access_key"),
+            "secret_key": c.get("s3_secret_key"),
+            "region": c.get("s3_region"),
+            "prefix": c.get("s3_path_prefix")
+        }
+
+        # Confirm with user
+        msg = (f"This will upload all files from:\n{local_dir}\n\n"
+               f"To S3 Bucket:\n{s3_config['bucket']}\n\n"
+               "This operation may take a while. Do you want to continue?")
+        if not messagebox.askyesno("Confirm Migration", msg, parent=self):
+            return
+
+        self.toggle_action_buttons(downloading=True) # Lock buttons
+        self.update_status_safe("Migrating...")
+        self.progress.start(10)
+        self.progress.set_text("Migrating...")
+        
+        # Connect signals
+        self.downloader.signals.status_changed.connect(self.update_status_safe)
+        self.downloader.signals.download_complete.connect(self.on_download_complete_safe)
+        self.downloader.signals.error_occurred.connect(self.on_error_safe)
+        
+        # Ask user if they want to delete local files after upload (Move vs Copy)
+        should_delete = messagebox.askyesno(
+            "Delete Local Files?", 
+            "Do you want to DELETE local files after they are successfully uploaded to S3?\n\n"
+            "YES: Move (Saves space, good for disk pressure)\n"
+            "NO: Copy (Keeps local backup, uses more space)",
+            parent=self
+        )
+
+        threading.Thread(target=self.downloader.migrate_to_s3, 
+                         args=(local_dir, s3_config), 
+                         kwargs={"remove_local": should_delete},
+                         daemon=True).start()
+
     def check_initial_path(self):
         """Check if download path is set, if not prompt user."""
         current_path = self.path_var.get()
         if not current_path or not os.path.exists(current_path):
-            response = messagebox.askyesno("Setup", "Download folder not set or invalid.\nWould you like to select one now?")
+            response = messagebox.askyesno("Setup", "Download folder not set or invalid.\nWould you like to select one now?", parent=self)
             if response:
                 self.browse_path()
     def browse_path(self):

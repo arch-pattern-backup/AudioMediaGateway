@@ -7,3 +7,5 @@ python-vlc>=3.0.20
 pyinstaller>=6.0.0
 
 
+
+boto3>=1.34.0

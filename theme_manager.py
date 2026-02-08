@@ -23,5 +23,10 @@ class ThemeManager:
 
     def load_title_font(self, size):
         # Fallback to Segoe UI for title as well, keeping it clean
-        return ImageFont.truetype("arial.ttf", size) 
-
+        try:
+            return ImageFont.truetype("segoeui.ttf", size)
+        except OSError:
+            try:
+                return ImageFont.truetype("arial.ttf", size)
+            except OSError:
+                return ImageFont.load_default()

@@ -109,6 +109,67 @@ def create_settings_card(parent, app, base_path):
     app.disable_sounds_var = tk.BooleanVar(value=False)
     add_toggle(3, 0, "Disable Notification Sounds", app.disable_sounds_var, "Turn off Windows alert notification sounds")
     
+    # --- Storage Settings ---
+    tk.Label(body, text="Storage Location", font=("Segoe UI", 9, "bold"),
+            bg=app.bg_card, fg=app.fg_secondary).pack(anchor="w", padx=12, pady=(12, 4))
+            
+    storage_row = tk.Frame(body, bg=app.bg_card)
+    storage_row.pack(fill="x", padx=12, pady=(0, 8))
+    
+    # Radio Buttons for Storage Type
+    def create_radio(parent, text, value, var):
+        r = tk.Radiobutton(parent, text=text, variable=var, value=value,
+                          bg=app.bg_card, fg=app.fg_primary, selectcolor=app.bg_card,
+                          activebackground=app.bg_card, activeforeground=app.fg_primary,
+                          font=("Segoe UI", 9))
+        r.pack(side=tk.LEFT, padx=(0, 15))
+        return r
+
+    create_radio(storage_row, "Local Folder", "local", app.storage_type_var)
+    create_radio(storage_row, "S3 / MinIO", "s3", app.storage_type_var)
+    
+    # S3 Settings Container
+    app.s3_settings_frame = tk.Frame(body, bg=app.bg_card)
+    app.s3_settings_frame.pack(fill="x", padx=12, pady=(0, 12))
+    
+    # Grid for S3 inputs
+    s3_grid = tk.Frame(app.s3_settings_frame, bg=app.bg_card)
+    s3_grid.pack(fill="x")
+    s3_grid.columnconfigure(0, weight=1)
+    s3_grid.columnconfigure(1, weight=1)
+    
+    def add_s3_input(row, col, label, var, show=None):
+        f = tk.Frame(s3_grid, bg=app.bg_card)
+        f.grid(row=row, column=col, sticky="ew", padx=4, pady=4)
+        
+        tk.Label(f, text=label, font=("Segoe UI", 8), bg=app.bg_card, fg=app.fg_secondary).pack(anchor="w")
+        
+        c = tk.Frame(f, bg=app.bg_input, highlightbackground=app.border_subtle, highlightthickness=1)
+        c.pack(fill="x", pady=(2, 0))
+        
+        e = tk.Entry(c, textvariable=var, font=("Segoe UI", 9), bg=app.bg_input, fg=app.fg_primary,
+                    insertbackground=app.fg_primary, relief="flat", bd=0, highlightthickness=0, show=show)
+        e.pack(fill="x", padx=6, pady=4, ipady=3)
+        return f
+
+    add_s3_input(0, 0, "Endpoint URL", app.s3_endpoint_var)
+    add_s3_input(0, 1, "Bucket Name", app.s3_bucket_var)
+    add_s3_input(1, 0, "Access Key", app.s3_access_key_var)
+    add_s3_input(1, 1, "Secret Key", app.s3_secret_key_var, show="●")
+    add_s3_input(2, 0, "Region (Optional)", app.s3_region_var)
+    add_s3_input(2, 1, "Path Prefix (Optional)", app.s3_path_prefix_var)
+
+    # Migration Button
+    migrate_row = tk.Frame(app.s3_settings_frame, bg=app.bg_card)
+    migrate_row.pack(fill="x", pady=(12, 0))
+    
+    migrate_btn = RoundedButton(migrate_row, "Migrate Local Files to S3", app.start_migration_thread,
+                                bg_color=app.bg_input, fg_color=app.accent_purple,
+                                hover_color=app.bg_dark, font=("Segoe UI", 9, "bold"),
+                                width=200, height=32, corner_radius=8, border_color=app.border_subtle)
+    migrate_btn.pack(side=tk.RIGHT)
+    app.create_tooltip(migrate_btn, "Scan local folder and upload all files to the configured S3 bucket")
+
     return card
 
 
