@@ -5,6 +5,14 @@ import json
 import threading
 import queue
 import time
+import datetime
+try:
+    import boto3
+    from botocore.exceptions import ClientError
+    BOTO3_AVAILABLE = True
+except ImportError:
+    BOTO3_AVAILABLE = False
+
 from suno_utils import read_song_metadata, save_lyrics_to_file, open_file
 from theme_manager import ThemeManager
 
@@ -105,6 +113,15 @@ class LibraryTab(tk.Frame):
                                relief="flat", cursor="hand2",
                                padx=15, pady=8)
         change_btn.pack(side=tk.RIGHT, padx=10)
+
+        # S3 Toggle Button
+        self.use_s3 = False
+        self.s3_btn = tk.Button(toolbar, text="💾 Storage: Local", command=self.toggle_storage_mode,
+                               bg=self.bg_card, fg=self.fg_primary,
+                               font=("Segoe UI", 10),
+                               relief="flat", cursor="hand2",
+                               padx=15, pady=8)
+        self.s3_btn.pack(side=tk.RIGHT, padx=10)
         
         # About button
         about_btn = tk.Button(toolbar, text="ℹ️ About", command=self.show_about,
@@ -427,16 +444,22 @@ class LibraryTab(tk.Frame):
         # Update path from config
         self.download_path = self.config_manager.get("path", "")
         
-        if not self.download_path or not os.path.exists(self.download_path):
+        if not self.download_path or (not os.path.exists(self.download_path) and not self.use_s3):
             # Silent return if not set, or maybe just show empty
             return
             
         # Start scanning
         self.is_scanning = True
-        self.refresh_btn.config(state="disabled", text="Scanning...")
-        self.count_label.config(text="Scanning...")
         
-        threading.Thread(target=self._scan_thread, daemon=True).start()
+        if self.use_s3:
+             self.refresh_btn.config(state="disabled", text="Scanning S3...")
+             self.count_label.config(text="Scanning S3...")
+             threading.Thread(target=self._scan_s3_thread, daemon=True).start()
+        else:
+            self.refresh_btn.config(state="disabled", text="Scanning...")
+            self.count_label.config(text="Scanning...")
+            threading.Thread(target=self._scan_thread, daemon=True).start()
+            
         self._process_scan_queue()
     
     def update_tree(self):
@@ -549,8 +572,63 @@ class LibraryTab(tk.Frame):
             return
         
         item = selection[0]
+        # Get tag (which is filepath or S3 key)
         filepath = self.tree.item(item)['tags'][0]
         
+        # S3 Support
+        if self.use_s3:
+            # excessive logic to get full song object not needed if we trust the tag/filepath
+            # But we need the bucket from config
+            s3_bucket = self.config_manager.get("s3_bucket", "")
+            if not s3_bucket:
+                messagebox.showerror("Configuration Error", "S3 Bucket not configured.")
+                return
+
+            # Generate presigned URL
+            try:
+                s3_endpoint = self.config_manager.get("s3_endpoint", "")
+                s3_access_key = self.config_manager.get("s3_access_key", "")
+                s3_secret_key = self.config_manager.get("s3_secret_key", "")
+                
+                session = boto3.session.Session()
+                s3_client = session.client(
+                    's3',
+                    endpoint_url=s3_endpoint,
+                    aws_access_key_id=s3_access_key,
+                    aws_secret_access_key=s3_secret_key,
+                    region_name='us-east-1'
+                )
+                
+                # The filepath in tree tag is s3://bucket/key
+                # We need just the key
+                key = filepath.replace(f"s3://{s3_bucket}/", "")
+                
+                url = s3_client.generate_presigned_url('get_object',
+                                                    Params={'Bucket': s3_bucket,
+                                                            'Key': key},
+                                                    ExpiresIn=3600)
+                
+                if self.player_widget:
+                    # Manually set metadata for the player
+                    filename = os.path.basename(key)
+                    title = filename
+                    artist = "Unknown"
+                    # Try to find in our list to get better metadata
+                    for song in self.filtered_songs:
+                         if song['id'] == key:
+                             title = song['title']
+                             artist = song['artist']
+                             break
+                    
+                    self.player_widget.play_file(url)
+                    self.player_widget.now_playing_label.config(text=title)
+                    self.player_widget.artist_label.config(text=f"{artist} (Streamed from S3)")
+                    
+            except Exception as e:
+                messagebox.showerror("S3 Error", f"Failed to generate playback URL: {e}")
+            return
+
+        # Local File Support
         # Normalize filepath
         filepath = os.path.normpath(filepath)
         
@@ -568,11 +646,6 @@ class LibraryTab(tk.Frame):
                 break
         
         if index != -1:
-            # Emit event with playlist data
-            # We can't pass complex data via event string, so we'll use a callback or direct method
-            # But since we are using bind, we need to pass data differently or change architecture
-            # Let's use a custom event with a reference, or just call a method on parent if possible
-            # Actually, main.py binds this. We can attach data to the widget temporarily
             self.current_playlist = self.filtered_songs
             self.current_index = index
             self.event_generate("<<PlaySong>>")
@@ -632,8 +705,111 @@ class LibraryTab(tk.Frame):
             self.tree.selection_set(item)
             self.context_menu.post(event.x_root, event.y_root)
     
+    def toggle_storage_mode(self):
+        """Toggle between Local and S3 storage."""
+        if not BOTO3_AVAILABLE:
+            messagebox.showerror("Missing Dependency", "boto3 is not installed or available.\nCannot access S3 storage.")
+            return
+
+        self.use_s3 = not self.use_s3
+        
+        if self.use_s3:
+            self.s3_btn.config(text="☁️ Storage: S3", fg="white", bg=self.accent_purple)
+            self.refresh_btn.config(text="🔄 Refresh S3")
+        else:
+            self.s3_btn.config(text="💾 Storage: Local", fg=self.fg_primary, bg=self.bg_card)
+            self.refresh_btn.config(text="🔄 Refresh")
+            
+        self.refresh_library()
+
+    def _scan_s3_thread(self):
+        """Background thread to scan S3 bucket."""
+        new_songs = []
+        
+        try:
+            # Get config
+            s3_endpoint = self.config_manager.get("s3_endpoint", "")
+            s3_access_key = self.config_manager.get("s3_access_key", "")
+            s3_secret_key = self.config_manager.get("s3_secret_key", "")
+            s3_bucket = self.config_manager.get("s3_bucket", "")
+            
+            if not s3_endpoint or not s3_access_key or not s3_secret_key or not s3_bucket:
+                print("S3 config missing")
+                self.scan_queue.put(("error", "S3 Config Missing"))
+                self.scan_queue.put(("done", None))
+                return
+
+            session = boto3.session.Session()
+            s3_client = session.client(
+                's3',
+                endpoint_url=s3_endpoint,
+                aws_access_key_id=s3_access_key,
+                aws_secret_access_key=s3_secret_key,
+                region_name='us-east-1'
+            )
+            
+            # List objects
+            paginator = s3_client.get_paginator('list_objects_v2')
+            pages = paginator.paginate(Bucket=s3_bucket)
+            
+            for page in pages:
+                if 'Contents' not in page:
+                    continue
+                    
+                for obj in page['Contents']:
+                    key = obj['Key']
+                    if key.lower().endswith(('.mp3', '.wav', '.flac')):
+                        # Parse simple metadata from key/size/date
+                        filename = os.path.basename(key)
+                        size = obj['Size']
+                        last_modified = obj['LastModified']
+                        
+                        # Try to parse Artist - Title from filename
+                        title = filename
+                        artist = "Unknown"
+                        
+                        # Remove extension
+                        name_no_ext = os.path.splitext(filename)[0]
+                        if " - " in name_no_ext:
+                            parts = name_no_ext.split(" - ", 1)
+                            artist = parts[0]
+                            title = parts[1]
+                        
+                        song_data = {
+                            'id': key, # Use S3 key as ID
+                            'filepath': f"s3://{s3_bucket}/{key}", # Virtual path
+                            'title': title,
+                            'artist': artist,
+                            'duration': 0, # Cannot easily get duration without downloading head
+                            'filesize': size,
+                            'date': last_modified.strftime('%Y-%m-%d %H:%M'),
+                            'genre': '',
+                            'tags': [],
+                            's3_key': key,
+                            's3_bucket': s3_bucket
+                        }
+                        
+                        new_songs.append(song_data)
+                        
+                        if len(new_songs) >= 50:
+                            self.scan_queue.put(("batch", list(new_songs)))
+                            new_songs = []
+            
+            if new_songs:
+                self.scan_queue.put(("batch", new_songs))
+                
+            self.scan_queue.put(("done", None))
+            
+        except Exception as e:
+            print(f"S3 Scan error: {e}")
+            self.scan_queue.put(("done", None))
+
     def open_download_folder(self):
         """Open the main download directory in system explorer."""
+        if self.use_s3:
+            messagebox.showinfo("S3 Storage", "Cannot open S3 bucket in file explorer.\nUse 'Web Console' or 'Change Folder' to switch to Local.")
+            return
+            
         path = self.config_manager.get("path", "")
         if path and os.path.exists(path):
             open_file(path)

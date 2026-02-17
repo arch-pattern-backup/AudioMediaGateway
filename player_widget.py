@@ -1,15 +1,91 @@
 import tkinter as tk
 from tkinter import ttk
-try:
-    import vlc
-    VLC_AVAILABLE = True
-except (ImportError, OSError):
-    VLC_AVAILABLE = False
 import os
-from threading import Thread
+import sys
+VLC_IMPORT_ERROR = None
+
+def setup_vlc():
+    """Attempt to find and configure VLC before importing."""
+    import ctypes
+    
+    # Common paths for libvlc on Linux/Mac/Windows
+    possible_paths = [
+        # Linux
+        "/usr/lib/x86_64-linux-gnu/libvlc.so.5",
+        "/usr/lib/libvlc.so.5",
+        "/usr/lib/libvlc.so",
+        "/usr/local/lib/libvlc.so",
+        # Windows (common default installs)
+        r"C:\Program Files\VideoLAN\VLC\libvlc.dll",
+        r"C:\Program Files (x86)\VideoLAN\VLC\libvlc.dll",
+        # Mac
+        "/Applications/VLC.app/Contents/MacOS/lib/libvlc.dylib"
+    ]
+    
+    # If standard import works, great
+    try:
+        import vlc
+        # Test if it actually works
+        i = vlc.Instance('--no-xlib')
+        i.release()
+        return True, vlc
+    except:
+        pass # Continue to manual search
+
+    # Try setting VLC_PLUGIN_PATH or LD_LIBRARY_PATH if we find the lib
+    found_lib = None
+    for path in possible_paths:
+        if os.path.exists(path):
+            found_lib = path
+            break
+            
+    if found_lib:
+        print(f"DEBUG: Found libvlc at {found_lib}")
+        directory = os.path.dirname(found_lib)
+        
+        # Windows: Add to PATH
+        if sys.platform.startswith('win'):
+            os.environ['PATH'] = directory + ';' + os.environ['PATH']
+            if hasattr(os, 'add_dll_directory'):
+                os.add_dll_directory(directory)
+                
+        # Linux: Try ctypes load global AND set plugin path
+        if sys.platform.startswith('linux'):
+            try:
+                ctypes.CDLL(found_lib, mode=ctypes.RTLD_GLOBAL)
+            except Exception as e:
+                print(f"DEBUG: Failed to load libvlc via ctypes: {e}")
+            
+            # Try to guess plugin path
+            # /usr/lib/x86_64-.../libvlc.so.5 -> /usr/lib/x86_64-.../vlc/plugins
+            lib_dir = os.path.dirname(found_lib)
+            plugin_path = os.path.join(lib_dir, 'vlc', 'plugins')
+            if not os.path.exists(plugin_path):
+                # Try one level up (e.g. /usr/lib/vlc/plugins)
+                plugin_path = os.path.join(os.path.dirname(lib_dir), 'vlc', 'plugins')
+            
+            if os.path.exists(plugin_path):
+                print(f"DEBUG: Setting VLC_PLUGIN_PATH to {plugin_path}")
+                os.environ['VLC_PLUGIN_PATH'] = plugin_path
+
+    try:
+        import vlc
+        return True, vlc
+    except (ImportError, OSError) as e:
+        return False, e
+
+VLC_AVAILABLE, _vlc_result = setup_vlc()
+if VLC_AVAILABLE:
+    vlc = _vlc_result
+    print(f"DEBUG: VLC module imported successfully. Version: {vlc.__version__}")
+else:
+    VLC_IMPORT_ERROR = str(_vlc_result)
+    print(f"DEBUG: VLC Import Failed: {VLC_IMPORT_ERROR}")
+
 import time
 import json
 import random
+from threading import Thread
 from suno_utils import open_file
 
 
@@ -20,15 +96,30 @@ class PlayerWidget(tk.Frame):
         super().__init__(parent, **kwargs)
         
         # VLC instance
+
         # VLC instance
+        self.vlc_error = None
         if VLC_AVAILABLE:
             try:
+                print("DEBUG: Attempting to initialize VLC instance...")
                 self.instance = vlc.Instance('--no-xlib')  # Headless mode
+                print(f"DEBUG: VLC Instance created: {self.instance}")
+                
+                if self.instance is None:
+                    raise Exception("Failed to create VLC Instance (libvlc could not be initialized).")
+
                 self.player = self.instance.media_player_new()
+                print(f"DEBUG: VLC Player created: {self.player}")
             except Exception as e:
+                print(f"ERROR: VLC initialization failed: {e}")
+                self.vlc_error = str(e)
+                import traceback
+                traceback.print_exc()
                 # VLC not available or failed to initialize
                 self.player = None
         else:
+            print("DEBUG: VLC_AVAILABLE is False")
+            self.vlc_error = VLC_IMPORT_ERROR or "VLC module not available"
             self.player = None
         
         # Player state
@@ -81,10 +172,18 @@ class PlayerWidget(tk.Frame):
         self.now_playing_label.pack(fill="x", pady=(15, 0))
         
         if not self.player:
-            self.now_playing_label.config(text="⚠️ VLC Player not found", fg="#ef4444")
-            tk.Label(info_frame, text="Playback disabled", 
+            status_text = "⚠️ VLC Player not found"
+            self.now_playing_label.config(text=status_text, fg="#ef4444")
+            
+            error_details = getattr(self, 'vlc_error', "Unknown error")
+            lbl = tk.Label(info_frame, text="Playback disabled", 
                     bg=self.bg_card, fg=self.fg_secondary,
-                    font=("Segoe UI", 9)).pack(fill="x")
+                    font=("Segoe UI", 9))
+            lbl.pack(fill="x")
+            
+            # Create a tooltip with the actual error
+            from suno_utils import create_tooltip
+            create_tooltip(self.now_playing_label, f"Error details: {error_details}\n\nTip: Ensure 'python-vlc' is installed and VLC Media Player is on your system.")
         
         # Artist label
         self.artist_label = tk.Label(info_frame, text="",
@@ -380,7 +479,9 @@ class PlayerWidget(tk.Frame):
             messagebox.showerror("Player Error", "VLC player failed to initialize.")
             return False
         
-        if not os.path.exists(filepath):
+        is_url = filepath.lower().startswith(('http://', 'https://', 's3://'))
+        
+        if not is_url and not os.path.exists(filepath):
             import tkinter.messagebox as messagebox
             messagebox.showerror("File Not Found", f"File does not exist:\n{filepath}")
             return False

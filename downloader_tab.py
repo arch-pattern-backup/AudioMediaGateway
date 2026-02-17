@@ -975,6 +975,15 @@ class DownloaderTab(tk.Frame):
             organize_by_track=self.track_folder_var.get(),
             stems_only=self.filter_settings.get("stems_only"),
             smart_resume=self.smart_resume_var.get(),
+            storage_type=self.storage_type_var.get(),
+            s3_config={
+                "endpoint": self.s3_endpoint_var.get(),
+                "bucket": self.s3_bucket_var.get(),
+                "region": self.s3_region_var.get(),
+                "access_key": self.s3_access_key_var.get(),
+                "secret_key": self.s3_secret_key_var.get(),
+                "prefix": self.s3_path_prefix_var.get(),
+            },
             scan_only=True  # CRITICAL: Only scan, don't download
         )
         
@@ -1067,7 +1076,16 @@ class DownloaderTab(tk.Frame):
             filter_settings=self.filter_settings,
             organize_by_track=self.track_folder_var.get(),
             stems_only=self.filter_settings.get("stems_only"),
-            smart_resume=self.smart_resume_var.get()
+            smart_resume=self.smart_resume_var.get(),
+            storage_type=self.storage_type_var.get(),
+            s3_config={
+                "endpoint": self.s3_endpoint_var.get(),
+                "bucket": self.s3_bucket_var.get(),
+                "region": self.s3_region_var.get(),
+                "access_key": self.s3_access_key_var.get(),
+                "secret_key": self.s3_secret_key_var.get(),
+                "prefix": self.s3_path_prefix_var.get(),
+            }
         )
         
         thread = threading.Thread(target=self.downloader.run, daemon=True)

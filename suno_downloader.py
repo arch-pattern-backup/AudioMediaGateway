@@ -14,6 +14,8 @@ except ImportError:
     boto3 = None
 
 from suno_utils import RateLimiter, get_downloaded_uuids, embed_metadata, sanitize_filename, get_unique_filename
+from mutagen.id3 import ID3
+from mutagen.wave import WAVE
 
 GEN_API_BASE = "https://studio-api.prod.suno.com"
 
@@ -779,6 +781,46 @@ class SunoDownloader:
         if not is_s3:
             if os.path.exists(out_path):
                 out_path = get_unique_filename(out_path)
+
+        # --- S3 IDEMPOTENCY CHECK ---
+        s3_key = ""
+        if is_s3:
+            try:
+                # Calculate S3 Key early
+                rel_path = os.path.relpath(target_dir, directory) 
+                if rel_path == ".": rel_path = ""
+                
+                s3_key_parts = []
+                prefix = s3_conf.get('prefix', '')
+                if prefix: s3_key_parts.append(prefix)
+                if rel_path: s3_key_parts.append(rel_path.replace(os.path.sep, '/'))
+                s3_key_parts.append(fname)
+                s3_key = "/".join(s3_key_parts).replace("//", "/")
+
+                if not boto3:
+                    raise ImportError("boto3 is not installed")
+
+                s3_client = boto3.client(
+                    's3',
+                    endpoint_url=s3_conf.get('endpoint'),
+                    aws_access_key_id=s3_conf.get('access_key'),
+                    aws_secret_access_key=s3_conf.get('secret_key'),
+                    region_name=s3_conf.get('region')
+                )
+                bucket = s3_conf.get('bucket')
+
+                try:
+                    s3_client.head_object(Bucket=bucket, Key=s3_key)
+                    self._log(f"Skipping: {title} (already on S3)", "info")
+                    self.signals.song_finished.emit(uuid, True, f"s3://{bucket}/{s3_key}")
+                    self.signals.song_updated.emit(uuid, "Complete (S3)", 100)
+                    existing_uuids.add(uuid)
+                    return
+                except:
+                    # Not found or error checking, proceed to download
+                    pass
+            except Exception as e:
+                self._log(f"S3 Check Error: {e}", "warning")
         
         self._log(f"Downloading: {title}", "downloading", thumbnail_data=thumb_data)
         self.signals.song_updated.emit(uuid, "Downloading", 0)
@@ -828,40 +870,56 @@ class SunoDownloader:
         if download_success and self.config.get("embed_metadata"):
              try:
                  self._log(f"Embedding metadata for {title}...", "info")
-                 embed_metadata(out_path, clip, thumb_data)
+                 
+                 # Extract exact arguments expected by embed_metadata
+                 meta_dict = clip.get("metadata", {})
+                 embed_metadata(
+                     audio_path=out_path,
+                     image_url=clip.get("image_url"),
+                     title=title,
+                     artist=clip.get("display_name"),
+                     album="Suno AI Generation", # Default album
+                     genre=meta_dict.get("tags"),
+                     year=None, # will be parsed from created_at inside if needed, or pass explicit
+                     comment=meta_dict.get("prompt"),
+                     lyrics=lyrics,
+                     uuid=uuid,
+                     token=self.config.get("token")
+                 )
              except Exception as e:
                  self._log(f"Metadata error: {e}", "warning")
         
         # S3 Upload Phase
-        s3_key = ""
         if download_success and is_s3:
             try:
-                if not boto3:
-                    raise ImportError("boto3 is not installed")
+                if 's3_client' not in locals() or s3_client is None:
+                    if not boto3:
+                        raise ImportError("boto3 is not installed")
+                    s3_client = boto3.client(
+                        's3',
+                        endpoint_url=s3_conf.get('endpoint'),
+                        aws_access_key_id=s3_conf.get('access_key'),
+                        aws_secret_access_key=s3_conf.get('secret_key'),
+                        region_name=s3_conf.get('region')
+                    )
+
+                bucket = s3_conf.get('bucket')
+                
+                # Use pre-calculated key if available, otherwise recalculate
+                if not s3_key:
+                    prefix = s3_conf.get('prefix', '')
+                    rel_path = os.path.relpath(target_dir, directory) 
+                    if rel_path == ".": rel_path = ""
+                    
+                    s3_key_parts = []
+                    if prefix: s3_key_parts.append(prefix)
+                    if rel_path: s3_key_parts.append(rel_path.replace(os.path.sep, '/'))
+                    s3_key_parts.append(fname)
+                    
+                    s3_key = "/".join(s3_key_parts).replace("//", "/")
                 
                 self.signals.song_updated.emit(uuid, "Uploading to S3", 100)
                 self._log(f"Uploading to S3: {title}...", "info")
-                
-                s3_client = boto3.client(
-                    's3',
-                    endpoint_url=s3_conf.get('endpoint'),
-                    aws_access_key_id=s3_conf.get('access_key'),
-                    aws_secret_access_key=s3_conf.get('secret_key'),
-                    region_name=s3_conf.get('region')
-                )
-                
-                bucket = s3_conf.get('bucket')
-                prefix = s3_conf.get('prefix', '')
-                
-                rel_path = os.path.relpath(target_dir, directory) 
-                if rel_path == ".": rel_path = ""
-                
-                s3_key_parts = []
-                if prefix: s3_key_parts.append(prefix)
-                if rel_path: s3_key_parts.append(rel_path.replace(os.path.sep, '/'))
-                s3_key_parts.append(fname)
-                
-                s3_key = "/".join(s3_key_parts).replace("//", "/")
                 
                 s3_client.upload_file(out_path, bucket, s3_key)
                 self._log(f"Uploaded to {bucket}/{s3_key}", "success")
@@ -1096,6 +1154,45 @@ class SunoDownloader:
         self._log(f"Starting migration from {local_dir} to s3://{bucket}/{prefix}", "info")
         self.signals.status_changed.emit("Migrating...")
 
+        # --- SAFETY CHECK: Detect if Local Dir is a mount of the S3 Bucket ---
+        try:
+            canary_filename = f".sunosync_canary_{int(time.time())}.tmp"
+            canary_path = os.path.join(local_dir, canary_filename)
+            canary_key = f"{prefix}/{canary_filename}".replace("//", "/") if prefix else canary_filename
+            
+            # 1. Create local canary
+            with open(canary_path, "w") as f:
+                f.write("canary")
+            
+            # 2. Check if it appears in S3 (Wait briefly for consistency if needed, though mounts are usually immediate-ish)
+            # Actually, if it's a mount, writing locally SHOULD make it appear in S3 list_objects or head_object
+            # But S3 is eventually consistent. 
+            # Better check: List S3, see if file exists.
+            
+            # Give it a moment if it's a network mount sync
+            time.sleep(1) 
+            
+            try:
+                s3_client.head_object(Bucket=bucket, Key=canary_key)
+                is_coupled = True
+            except:
+                is_coupled = False
+            
+            # Cleanup local canary
+            if os.path.exists(canary_path):
+                os.remove(canary_path)
+                
+            if is_coupled:
+                self._log("CRITICAL: Source directory appears to be coupled with S3 Bucket (Mount detected).", "error")
+                self._log("Aborting migration to prevent data loss. You are already on S3!", "error")
+                self.signals.status_changed.emit("Migration Aborted")
+                self.signals.download_complete.emit(False)
+                return
+                
+        except Exception as e:
+            self._log(f"Safety check warning: {e}", "warning")
+        # ---------------------------------------------------------------------
+
         files_to_migrate = []
         for root, dirs, files in os.walk(local_dir):
             for file in files:
@@ -1124,13 +1221,26 @@ class SunoDownloader:
 
                 # Check if exists on S3
                 try:
-                    s3_client.head_object(Bucket=bucket, Key=s3_key)
+                    head = s3_client.head_object(Bucket=bucket, Key=s3_key)
                     # Exists
                     if remove_local:
-                        self._log(f"File already exists on S3, deleting local: {os.path.basename(file_path)}", "info")
-                        os.remove(file_path)
-                        migrated_count += 1
-                        continue
+                        # SAFETY CHECK: If the file exists and we are asked to delete local,
+                        # we must be careful not to delete if source == dest.
+                        # Since we can't easily know if it's a mount, we should be conservative.
+                        # However, legitimate use case is "Move to S3 (Deduplicate)".
+                        
+                        # Verify sizes match at least
+                        local_size = os.path.getsize(file_path)
+                        remote_size = head.get('ContentLength', -1)
+                        
+                        if local_size == remote_size:
+                             self._log(f"File exists on S3 (size match), deleting local: {os.path.basename(file_path)}", "info")
+                             os.remove(file_path)
+                             migrated_count += 1
+                             continue
+                        else:
+                             self._log(f"File exists on S3 but size differs (Local: {local_size}, Remote: {remote_size}). Skipping delete for safety.", "warning")
+                             continue
                     else:
                         self._log(f"File already exists on S3, skipping: {os.path.basename(file_path)}", "info")
                         continue
@@ -1170,3 +1280,360 @@ class SunoDownloader:
         self._log(f"Migration complete. Migrated: {migrated_count}, Errors: {errors_count}", "success")
         self.signals.status_changed.emit("Migration Complete")
         self.signals.download_complete.emit(True)
+
+    def repair_s3_metadata(self, target_month=None):
+        """
+        Repairs metadata for files on S3.
+        Strategy:
+        1. Local First: If file exists locally, embed metadata and upload to S3.
+        2. S3 Second: If not local, download from S3, embed, and re-upload.
+        """
+        token = self.config.get("token", "").strip()
+        if not token:
+            self._log("Token missing. Cannot fetch library for repair.", "error")
+            return
+
+        directory = self.config.get("directory")
+        s3_conf = self.config.get("s3_config", {})
+        
+        # Check S3 Config
+        if not (s3_conf.get('access_key') and s3_conf.get('bucket')):
+             self._log("S3 configuration missing. Cannot repair S3 files.", "error")
+             return
+
+        # Initialize S3 Client
+        try:
+            if not boto3: raise ImportError("boto3 missing")
+            s3_client = boto3.client(
+                's3',
+                endpoint_url=s3_conf.get('endpoint'),
+                aws_access_key_id=s3_conf.get('access_key'),
+                aws_secret_access_key=s3_conf.get('secret_key'),
+                region_name=s3_conf.get('region')
+            )
+            bucket = s3_conf.get('bucket')
+            prefix = s3_conf.get('prefix', '')
+        except Exception as e:
+            self._log(f"Failed to initialize S3 client: {e}", "error")
+            return
+
+        self._log("Fetching library from Suno...", "info")
+        # auto-detect workspace/project from filter settings if needed, but for now scan generic library
+        # defaulting to "My Library" behavior (fetch all)
+        projects = [None] # None represents main library
+        
+        # If user wants a specific project, we should probably support that, 
+        # but the request was "constrain to this month", implying a date filter on the WHOLE library.
+        # We will use fetch_user_library logic equivalent.
+        
+        # We'll use the existing pagination logic but just to get the list
+        # Re-using internal fetch logic is hard because 'run' does everything.
+        # Let's write a targeted fetch loop here.
+        
+        headers = {"Authorization": f"Bearer {token}"}
+        base_url = "https://studio-api.prod.suno.com/api/feed/?page="
+        page = 1
+        processed_count = 0
+        repaired_count = 0
+        skipped_count = 0
+        error_count = 0
+        
+        self.signals.status_changed.emit("Fetching Library...")
+
+        while True:
+            if self.is_stopped(): break
+            if self.is_stopped(): break
+            try:
+                msg = f"Fetching page {page}..."
+                print(msg)
+                self.signals.status_changed.emit(msg)
+                
+                # Retry loop for 429 Errors
+                max_retries = 3
+                retry_delay = 30 # seconds
+                
+                for attempt in range(max_retries + 1):
+                    try:
+                        r = requests.get(f"{base_url}{page}", headers=headers, timeout=30)
+                        r.raise_for_status()
+                        break # Success
+                    except requests.exceptions.HTTPError as e:
+                        if e.response.status_code == 429:
+                            if attempt < max_retries:
+                                self._log(f"Rate limited (429). Waiting {retry_delay}s...", "warning")
+                                time.sleep(retry_delay)
+                                retry_delay *= 2 # Exponential backoff
+                                continue
+                        raise e # Re-raise other errors or if retries exhausted
+
+                data = r.json()
+                
+                # Rate Limit Kindness
+                time.sleep(2) # Wait 2 seconds between pages
+                
+                clips = data if isinstance(data, list) else data.get('clips', [])
+                if not clips: break # End of library
+                
+                for clip in clips:
+                    if self.is_stopped(): break
+                    
+                    # Unwrap logic
+                    if isinstance(clip, dict) and "clip" in clip:
+                        clip = clip["clip"]
+                    
+                    if not clip: continue
+
+                    # Date Filter
+                    created_at = clip.get("created_at", "")
+                    if target_month:
+                        # expected format: YYYY-MM
+                        if not created_at.startswith(target_month):
+                            # Assumes feed is roughly chronological. 
+                            # If we see a date OLDER than target_month, we might be able to stop?
+                            # Suno feed is usually newest first.
+                            if created_at < target_month:
+                                self._log("Reached songs older than target month. Stopping scan.", "success")
+                                return
+                            continue
+
+                    # Metadata
+                    uuid = clip.get("id")
+                    title = clip.get("title") or uuid
+                    clean_title = sanitize_filename(title)
+                    display_name = clip.get("display_name")
+                    metadata = clip.get("metadata", {})
+                    prompt = metadata.get("prompt", "")
+                    
+                    self._log(f"Processing: {title} ({created_at})", "info")
+                    processed_count += 1
+
+                    # Determine expected filenames
+                    # We check:
+                    # 1. Root download dir
+                    # 2. Month folder (if created_at exists)
+                    # 3. Track folder (if stem)
+                    
+                    possible_local_paths = []
+                    
+                    # Extensions to check
+                    extensions = [".mp3", ".wav"]
+                    
+                    # Root
+                    for ext in extensions:
+                        possible_local_paths.append(os.path.join(directory, f"{clean_title}{ext}"))
+                    
+                    # Month Folder
+                    if created_at:
+                        month_folder = created_at[:7]
+                        for ext in extensions:
+                            possible_local_paths.append(os.path.join(directory, month_folder, f"{clean_title}{ext}"))
+                    
+                    # Check which one exists
+                    local_file_path = None
+                    for p in possible_local_paths:
+                        if os.path.exists(p):
+                            local_file_path = p
+                            break
+                        # Debug: check for partial matches or "v2" suffix if not found?
+                        # For now, let's just log what we checked if we fail
+                    
+                    if not local_file_path:
+                         self._log(f"  Debug: Checked paths: {possible_local_paths}", "downloading")
+
+                    # S3 Key Calculation (We align with standard upload logic)
+                    
+                    # S3 Key Calculation (We align with standard upload logic)
+                    # Standard logic: prefix + (optional month folder) + filename
+                    # We need to know where it SHOULD be on S3.
+                    # If the user uses 'organize_by_month', it goes into a folder.
+                    # We should probably check BOTH locations on S3 or prefer the month folder if we have it?
+                    # Plan: Check S3 for the file using the same logic as local folders.
+                    
+                    s3_keys_to_check = []
+                    
+                    # 1. Determine Target Key (for Upload - Case A)
+                    # Use local extension if found, otherwise default to .mp3
+                    target_ext = ".mp3"
+                    if local_file_path:
+                        _, target_ext = os.path.splitext(local_file_path)
+                    
+                    target_parts = []
+                    if prefix: target_parts.append(prefix)
+                    if created_at: target_parts.append(created_at[:7]) # Always use month folder for target
+                    target_parts.append(f"{clean_title}{target_ext}")
+                    target_s3_key = "/".join(target_parts).replace("//", "/")
+
+                    # 2. Build Search Keys (for Download fallback - Case B)
+                    # Check Month and Root, for both mp3 and wav
+                    search_locs = []
+                    if created_at: search_locs.append(created_at[:7])
+                    search_locs.append("") # Root
+                    
+                    for loc in search_locs:
+                        for ext in [".mp3", ".wav"]:
+                            kp = []
+                            if prefix: kp.append(prefix)
+                            if loc: kp.append(loc)
+                            kp.append(f"{clean_title}{ext}")
+                            k = "/".join(kp).replace("//", "/")
+                            if k not in s3_keys_to_check:
+                                s3_keys_to_check.append(k)
+                    
+                    # Smart Metadata Check: Verify if repair is actually needed
+                    if local_file_path:
+                        try:
+                            has_lyrics = False
+                            has_cover = False
+                            
+                            # Check based on extension
+                            is_wav = local_file_path.lower().endswith(".wav")
+                            
+                            if is_wav:
+                                audio = WAVE(local_file_path)
+                                if audio.tags:
+                                    # mutagen.wave uses ID3 tags if added via our utility
+                                    # keys are like 'USLT:...'
+                                    for key in audio.tags.keys():
+                                        if key.startswith("USLT"): has_lyrics = True
+                                        if key.startswith("APIC"): has_cover = True
+                            else:
+                                audio = ID3(local_file_path)
+                                for key in audio.keys():
+                                    if key.startswith("USLT"): has_lyrics = True
+                                    if key.startswith("APIC"): has_cover = True
+                            
+                            # Decision logic
+                            # 1. Cover Art: Always required if we have an image_url (which we almost always do)
+                            # 2. Lyrics: Required ONLY if the API provided lyrics/text/prompt
+                            
+                            should_have_lyrics = bool(lyrics and lyrics.strip())
+                            
+                            is_complete = has_cover
+                            missing_items = []
+                            
+                            if not has_cover:
+                                is_complete = False
+                                missing_items.append("Cover Art")
+                                
+                            if should_have_lyrics and not has_lyrics:
+                                is_complete = False
+                                missing_items.append("Lyrics")
+                            
+                            if is_complete:
+                                self._log(f"  Metadata already complete (Lyrics={'Yes' if has_lyrics else 'N/A'}, Cover=Yes). Skipping.", "success")
+                                skipped_count += 1
+                                continue
+                            else:
+                                self._log(f"  Metadata incomplete (Missing: {', '.join(missing_items)}). Repairing...", "warning")
+
+                        except Exception as check_e:
+                            # If checking fails (e.g. corrupt tag), proceed to repair
+                            self._log(f"  Metadata check failed ({check_e}), forcing repair.", "warning")
+
+                    # Repair Logic
+                    try:
+                        # CASE A: Local File Exists
+                        if local_file_path:
+                            self._log(f"  Found locally: {local_file_path}", "info")
+                            # Embed Metadata
+                            self._log("  Embedding metadata...", "info")
+                             # Extract exact arguments expected by embed_metadata
+                            meta_dict = clip.get("metadata", {})
+                            lyrics = meta_dict.get("lyrics") or meta_dict.get("text") or meta_dict.get("prompt")
+                            
+                            embed_metadata(
+                                audio_path=local_file_path,
+                                image_url=clip.get("image_url"),
+                                title=title,
+                                artist=clip.get("display_name"),
+                                album="Suno AI Generation", 
+                                genre=meta_dict.get("tags"),
+                                year=created_at[:4] if created_at else None,
+                                comment=meta_dict.get("prompt"),
+                                lyrics=lyrics,
+                                uuid=uuid,
+                                token=self.config.get("token")
+                            )
+                            
+                            # Upload to S3
+                            self._log(f"  Uploading to S3: {target_s3_key}", "info")
+                            s3_client.upload_file(local_file_path, bucket, target_s3_key)
+                            
+                            # CLEANUP: If we just uploaded a .wav, check if there's an old .mp3 version and delete it
+                            if target_s3_key.endswith(".wav"):
+                                incorrect_mp3_key = target_s3_key[:-4] + ".mp3"
+                                try:
+                                    s3_client.head_object(Bucket=bucket, Key=incorrect_mp3_key)
+                                    self._log(f"  Found duplicate/incorrect .mp3 on S3. Deleting: {incorrect_mp3_key}", "warning")
+                                    s3_client.delete_object(Bucket=bucket, Key=incorrect_mp3_key)
+                                except:
+                                    pass # No .mp3 found, all good
+
+                            self._log("  Sync Complete.", "success")
+                            repaired_count += 1
+                        
+                        else:
+                            # CASE B: No Local File -> Check S3
+                            self._log("  Not found locally. Checking S3...", "info")
+                            found_s3_key = None
+                            for k in s3_keys_to_check:
+                                try:
+                                    s3_client.head_object(Bucket=bucket, Key=k)
+                                    found_s3_key = k
+                                    break
+                                except:
+                                    pass
+                            
+                            if found_s3_key:
+                                self._log(f"  Found on S3: {found_s3_key}. Downloading for repair...", "info")
+                                
+                                # Use correct extension from S3 key (e.g. .wav)
+                                _, s3_ext = os.path.splitext(found_s3_key)
+                                if not s3_ext: s3_ext = ".mp3" # Fallback
+
+                                with tempfile.NamedTemporaryFile(suffix=s3_ext, delete=False) as tmp:
+                                    temp_path = tmp.name
+                                
+                                try:
+                                    s3_client.download_file(bucket, found_s3_key, temp_path)
+                                    
+                                    # Embed
+                                    meta_dict = clip.get("metadata", {})
+                                    lyrics = meta_dict.get("lyrics") or meta_dict.get("text") or meta_dict.get("prompt")
+                                    embed_metadata(
+                                        audio_path=temp_path,
+                                        image_url=clip.get("image_url"),
+                                        title=title,
+                                        artist=clip.get("display_name"),
+                                        album="Suno AI Generation", 
+                                        genre=meta_dict.get("tags"),
+                                        year=created_at[:4] if created_at else None,
+                                        comment=meta_dict.get("prompt"),
+                                        lyrics=lyrics,
+                                        uuid=uuid,
+                                        token=self.config.get("token")
+                                    )
+                                    
+                                    # Upload
+                                    self._log(f"  Re-uploading repaired file to {found_s3_key}", "info")
+                                    s3_client.upload_file(temp_path, bucket, found_s3_key)
+                                    self._log("  Repair Complete.", "success")
+                                    repaired_count += 1
+                                    
+                                finally:
+                                    if os.path.exists(temp_path):
+                                        os.remove(temp_path)
+                            else:
+                                self._log("  File not found on S3 either. Skipping.", "warning")
+                                skipped_count += 1
+                                
+                    except Exception as e:
+                        self._log(f"  Repair Failed: {e}", "error")
+                        error_count += 1
+
+                page += 1
+            except Exception as e:
+                 self._log(f"Error fetching page {page}: {e}", "error")
+                 break
+
+        self._log(f"Repair Session Finished. Repaired: {repaired_count}, Skipped: {skipped_count}, Errors: {error_count}", "success")

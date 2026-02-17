@@ -48,7 +48,7 @@ if sys.platform == 'win32':
 
 datas = []
 binaries = []
-hiddenimports = ['mutagen', 'requests', 'colorama', 'pyperclip', 'PIL', 'PIL._tkinter_finder', 'PIL.ImageTk', 'boto3', 'botocore']
+hiddenimports = ['mutagen', 'requests', 'colorama', 'pyperclip', 'PIL', 'PIL._tkinter_finder', 'PIL.ImageTk', 'boto3', 'botocore', 'vlc', 'dateutil']
 
 # 2. Include resources folder
 if os.path.exists('resources'):
