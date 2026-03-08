@@ -196,8 +196,9 @@ class SunoDownloader:
 
         # Mode 2: Scan/Download from Feed/Workspace
         self.signals.status_changed.emit("Scanning...")
-        self._log("Scanning existing files...", "info")
-        self._log(f"Found {len(existing_uuids)} existing songs.", "info")
+        self.signals.status_changed.emit("Scanning...")
+        self._log(f"Scanning local cache directory: {directory}...", "info")
+        self._log(f"Found {len(existing_uuids)} existing songs in local cache.", "info")
 
         # --- URL Selection Logic ---
         workspace_id = filters.get("workspace_id")

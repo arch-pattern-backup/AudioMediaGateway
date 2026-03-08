@@ -21,6 +21,7 @@ class ConfigManager:
                 if "s3_access_key" not in self.config: self.config["s3_access_key"] = ""
                 if "s3_secret_key" not in self.config: self.config["s3_secret_key"] = ""
                 if "s3_path_prefix" not in self.config: self.config["s3_path_prefix"] = ""
+                if "s3_public_endpoint" not in self.config: self.config["s3_public_endpoint"] = ""
             except:
                 self.config = {}
         else:

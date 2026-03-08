@@ -157,7 +157,8 @@ def create_settings_card(parent, app, base_path):
     add_s3_input(1, 0, "Access Key", app.s3_access_key_var)
     add_s3_input(1, 1, "Secret Key", app.s3_secret_key_var, show="●")
     add_s3_input(2, 0, "Region (Optional)", app.s3_region_var)
-    add_s3_input(2, 1, "Path Prefix (Optional)", app.s3_path_prefix_var)
+    add_s3_input(2, 1, "Public Endpoint (Optional)", app.s3_public_endpoint_var)
+    add_s3_input(3, 0, "Path Prefix (Optional)", app.s3_path_prefix_var)
 
     # Migration Button
     migrate_row = tk.Frame(app.s3_settings_frame, bg=app.bg_card)

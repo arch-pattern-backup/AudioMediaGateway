@@ -205,6 +205,7 @@ class DownloaderTab(tk.Frame):
         self.s3_access_key_var = tk.StringVar(value=c.get("s3_access_key", ""))
         self.s3_secret_key_var = tk.StringVar(value=c.get("s3_secret_key", ""))
         self.s3_path_prefix_var = tk.StringVar(value=c.get("s3_path_prefix", ""))
+        self.s3_public_endpoint_var = tk.StringVar(value=c.get("s3_public_endpoint", ""))
 
         # Main Container (2-Column Grid)
         self.columnconfigure(0, weight=0, minsize=400) # Left Column (Fixed/Min width)
@@ -613,6 +614,7 @@ class DownloaderTab(tk.Frame):
         self.s3_access_key_var.set(c.get("s3_access_key", ""))
         self.s3_secret_key_var.set(c.get("s3_secret_key", ""))
         self.s3_path_prefix_var.set(c.get("s3_path_prefix", ""))
+        self.s3_public_endpoint_var.set(c.get("s3_public_endpoint", ""))
 
         # Bind traces for real-time summary updates
         self.token_var.trace_add("write", self.update_accordion_summaries)
@@ -707,6 +709,7 @@ class DownloaderTab(tk.Frame):
         c.set("s3_access_key", self.s3_access_key_var.get())
         c.set("s3_secret_key", self.s3_secret_key_var.get())
         c.set("s3_path_prefix", self.s3_path_prefix_var.get())
+        c.set("s3_public_endpoint", self.s3_public_endpoint_var.get())
         
         # Save disable sounds setting
         if hasattr(self, 'disable_sounds_var'):
@@ -978,6 +981,7 @@ class DownloaderTab(tk.Frame):
             storage_type=self.storage_type_var.get(),
             s3_config={
                 "endpoint": self.s3_endpoint_var.get(),
+                "public_endpoint": self.s3_public_endpoint_var.get(),
                 "bucket": self.s3_bucket_var.get(),
                 "region": self.s3_region_var.get(),
                 "access_key": self.s3_access_key_var.get(),
@@ -1080,6 +1084,7 @@ class DownloaderTab(tk.Frame):
             storage_type=self.storage_type_var.get(),
             s3_config={
                 "endpoint": self.s3_endpoint_var.get(),
+                "public_endpoint": self.s3_public_endpoint_var.get(),
                 "bucket": self.s3_bucket_var.get(),
                 "region": self.s3_region_var.get(),
                 "access_key": self.s3_access_key_var.get(),

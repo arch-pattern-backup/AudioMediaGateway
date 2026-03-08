@@ -247,6 +247,36 @@ class LibraryTab(tk.Frame):
             print(f"Error in reload_tags: {e}")
             import traceback
             traceback.print_exc()
+
+    def _get_s3_client(self, use_public_endpoint=False):
+        """Helper to get S3 client."""
+        try:
+            s3_endpoint = self.config_manager.get("s3_endpoint", "")
+            
+            # Use public endpoint if requested and available
+            if use_public_endpoint:
+                public_ep = self.config_manager.get("s3_public_endpoint", "")
+                if public_ep:
+                    print(f"DEBUG: Using Public S3 Endpoint: {public_ep}")
+                    s3_endpoint = public_ep
+                else:
+                    print(f"DEBUG: Public S3 Endpoint requested but not set. Using internal: {s3_endpoint}")
+
+            s3_access_key = self.config_manager.get("s3_access_key", "")
+            s3_secret_key = self.config_manager.get("s3_secret_key", "")
+            
+            session = boto3.session.Session()
+            return session.client(
+                's3',
+                endpoint_url=s3_endpoint,
+                aws_access_key_id=s3_access_key,
+                aws_secret_access_key=s3_secret_key,
+                region_name='us-east-1'
+            )
+        except Exception as e:
+            print(f"Failed to create S3 client: {e}")
+            return None
+
     
     def _restore_selection(self, filepath):
         """Restore selection to the specified filepath."""
@@ -586,18 +616,10 @@ class LibraryTab(tk.Frame):
 
             # Generate presigned URL
             try:
-                s3_endpoint = self.config_manager.get("s3_endpoint", "")
-                s3_access_key = self.config_manager.get("s3_access_key", "")
-                s3_secret_key = self.config_manager.get("s3_secret_key", "")
-                
-                session = boto3.session.Session()
-                s3_client = session.client(
-                    's3',
-                    endpoint_url=s3_endpoint,
-                    aws_access_key_id=s3_access_key,
-                    aws_secret_access_key=s3_secret_key,
-                    region_name='us-east-1'
-                )
+                # Use public endpoint for playback if available
+                s3_client = self._get_s3_client(use_public_endpoint=True)
+                if not s3_client:
+                    raise Exception("Failed to initialize S3 client")
                 
                 # The filepath in tree tag is s3://bucket/key
                 # We need just the key
@@ -620,6 +642,7 @@ class LibraryTab(tk.Frame):
                              artist = song['artist']
                              break
                     
+                    print(f"DEBUG: Playing S3 URL: {url}")
                     self.player_widget.play_file(url)
                     self.player_widget.now_playing_label.config(text=title)
                     self.player_widget.artist_label.config(text=f"{artist} (Streamed from S3)")
@@ -847,38 +870,64 @@ class LibraryTab(tk.Frame):
         if not filepath:
             messagebox.showwarning("No Selection", "Please select a song first.")
             return
-        
-        # Normalize filepath for comparison
-        filepath = os.path.normpath(filepath)
-        
-        # Always read fresh metadata from file to get latest lyrics
-        # Don't rely on cache which might be stale
-        try:
-            song_meta = read_song_metadata(filepath)
-            if not song_meta:
-                messagebox.showerror("Error", f"Could not read metadata from file:\n{filepath}")
-                return
-        except Exception as e:
-            messagebox.showerror("Error", f"Could not read file:\n{filepath}\n\nError: {e}")
-            return
-        
-        # Get lyrics - prioritize .txt file if it exists, then metadata
+            
         current_lyrics = ''
-        txt_path = os.path.splitext(filepath)[0] + ".txt"
+        song_title = "Unknown"
         
-        # First, check for .txt file (most reliable source)
-        if os.path.exists(txt_path):
+        # --- S3 Handling ---
+        if self.use_s3:
+            s3_bucket = self.config_manager.get("s3_bucket", "")
+            if not s3_bucket: return
+            
+            # Extract key
+            key = filepath.replace(f"s3://{s3_bucket}/", "")
+            song_title = os.path.basename(key)
+            
+            # Try to get existing lyrics from .txt
+            txt_key = os.path.splitext(key)[0] + ".txt"
+            
+            s3_client = self._get_s3_client() # Use internal endpoint for API ops
+            if s3_client:
+                try:
+                    response = s3_client.get_object(Bucket=s3_bucket, Key=txt_key)
+                    current_lyrics = response['Body'].read().decode('utf-8')
+                except ClientError as e:
+                    # 404 is fine, just means no lyrics yet
+                    if e.response['Error']['Code'] != "NoSuchKey":
+                        print(f"Error fetching lyrics: {e}")
+                except Exception as e:
+                    print(f"Error fetching lyrics: {e}")
+        
+        # --- Local File Handling ---
+        else:
+            # Normalize filepath for comparison
+            filepath = os.path.normpath(filepath)
+            
+            # Always read fresh metadata from file to get latest lyrics
             try:
-                with open(txt_path, 'r', encoding='utf-8') as f:
-                    current_lyrics = f.read()
+                song_meta = read_song_metadata(filepath)
+                if not song_meta:
+                    messagebox.showerror("Error", f"Could not read metadata from file:\n{filepath}")
+                    return
+                song_title = song_meta.get('title', os.path.basename(filepath))
             except Exception as e:
-                print(f"Error reading lyrics from .txt file: {e}")
-        
-        # If no .txt file or empty, check metadata
-        if not current_lyrics or current_lyrics.strip() == '':
-            current_lyrics = song_meta.get('lyrics', '')
-        
-        song_title = song_meta.get('title', os.path.basename(filepath))
+                messagebox.showerror("Error", f"Could not read file:\n{filepath}\n\nError: {e}")
+                return
+            
+            # Get lyrics - prioritize .txt file if it exists, then metadata
+            txt_path = os.path.splitext(filepath)[0] + ".txt"
+            
+            # First, check for .txt file
+            if os.path.exists(txt_path):
+                try:
+                    with open(txt_path, 'r', encoding='utf-8') as f:
+                        current_lyrics = f.read()
+                except Exception as e:
+                    print(f"Error reading lyrics from .txt file: {e}")
+            
+            # If no .txt file or empty, check metadata
+            if not current_lyrics or current_lyrics.strip() == '':
+                current_lyrics = song_meta.get('lyrics', '')
         
         # Create Dialog
         dialog = tk.Toplevel(self.winfo_toplevel())
@@ -921,6 +970,29 @@ class LibraryTab(tk.Frame):
         
         def save():
             new_lyrics = text_area.get("1.0", "end-1c")
+            
+            # --- S3 Save ---
+            if self.use_s3:
+                try:
+                    s3_bucket = self.config_manager.get("s3_bucket", "")
+                    key = filepath.replace(f"s3://{s3_bucket}/", "")
+                    txt_key = os.path.splitext(key)[0] + ".txt"
+                    
+                    s3_client = self._get_s3_client()
+                    if s3_client:
+                        s3_client.put_object(
+                            Bucket=s3_bucket,
+                            Key=txt_key,
+                            Body=new_lyrics.encode('utf-8'),
+                            ContentType='text/plain'
+                        )
+                        messagebox.showinfo("Success", "Lyrics saved to S3 successfully!")
+                        dialog.destroy()
+                except Exception as e:
+                     messagebox.showerror("Error", f"Failed to save lyrics to S3: {e}")
+                return
+
+            # --- Local Save ---
             normalized_filepath = os.path.normpath(filepath)
             
             # Save to .txt file first
@@ -945,7 +1017,7 @@ class LibraryTab(tk.Frame):
             
             if txt_saved:
                 # Update cache
-                if song_meta:
+                if 'song_meta' in locals() and song_meta:
                     song_meta['lyrics'] = new_lyrics
                 
                 # Verify .txt file was written correctly
