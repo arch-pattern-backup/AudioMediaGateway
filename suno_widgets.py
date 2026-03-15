@@ -250,11 +250,9 @@ class CollapsibleCard(RoundedCardFrame):
 
     def _adjust_size(self):
         self.inner.update_idletasks()
-        header_height = self.header.winfo_reqheight()
-        body_height = self.body.winfo_reqheight() if not self.collapsed else 0
-        total_height = header_height + body_height + self.padding * 2
-        event = type("E", (), {"width": self.canvas.winfo_width(), "height": max(total_height, 1)})
-        self.canvas.config(height=event.height)
+        total_height = self.inner.winfo_reqheight() + self.padding * 2
+        self.canvas.config(height=total_height)
+        event = type("E", (), {"width": self.canvas.winfo_width(), "height": total_height})
         self._redraw(event)
 
 

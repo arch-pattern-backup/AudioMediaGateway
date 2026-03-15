@@ -34,8 +34,8 @@ if sys.platform == 'win32':
                             StringStruct(u'FileVersion', u'1.0.0.0'),
                             StringStruct(u'InternalName', u'SunoApiDownloader'),
                             StringStruct(u'LegalCopyright', u'Copyright (C) 2024'),
-                            StringStruct(u'OriginalFilename', u'SunoApiDownloader.exe'),
-                            StringStruct(u'ProductName', u'SunoSync'),
+                            StringStruct(u'OriginalFilename', u'SunoSync-Nexus.exe'),
+                            StringStruct(u'ProductName', u'SunoSync-Nexus'),
                             StringStruct(u'ProductVersion', u'1.0.0.0')
                         ]
                     )
@@ -48,7 +48,7 @@ if sys.platform == 'win32':
 
 datas = []
 binaries = []
-hiddenimports = ['mutagen', 'requests', 'colorama', 'pyperclip', 'PIL', 'PIL._tkinter_finder', 'PIL.ImageTk', 'boto3', 'botocore', 'vlc', 'dateutil']
+hiddenimports = ['mutagen', 'requests', 'colorama', 'pyperclip', 'PIL', 'PIL._tkinter_finder', 'PIL.ImageTk', 'boto3', 'botocore', 'vlc', 'dateutil', 'db_manager', 'sync_s3_inventory']
 
 # 2. Include resources folder
 if os.path.exists('resources'):
@@ -82,7 +82,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='SunoSyncV2',
+    name='SunoSync-Nexus',
     icon='resources/icon.ico' if sys.platform == 'win32' else None,
     debug=False,
     bootloader_ignore_signals=False,

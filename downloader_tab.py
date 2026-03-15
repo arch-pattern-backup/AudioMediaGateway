@@ -206,6 +206,7 @@ class DownloaderTab(tk.Frame):
         self.s3_secret_key_var = tk.StringVar(value=c.get("s3_secret_key", ""))
         self.s3_path_prefix_var = tk.StringVar(value=c.get("s3_path_prefix", ""))
         self.s3_public_endpoint_var = tk.StringVar(value=c.get("s3_public_endpoint", ""))
+        self.last_full_sync_var = tk.StringVar(value=c.get("last_full_sync", "Never"))
 
         # Main Container (2-Column Grid)
         self.columnconfigure(0, weight=0, minsize=400) # Left Column (Fixed/Min width)
@@ -410,11 +411,19 @@ class DownloaderTab(tk.Frame):
             self.stop_btn.config_state("normal")
             if hasattr(self, 'preload_btn'):
                 self.preload_btn.config_state("disabled")
+            if hasattr(self, 'sync_btn'):
+                self.sync_btn.config_state("disabled")
+            if hasattr(self, 'migrate_btn'):
+                self.migrate_btn.config_state("disabled")
         else:
             self.start_btn.config_state("normal")
             self.stop_btn.config_state("disabled")
             if hasattr(self, 'preload_btn'):
                 self.preload_btn.config_state("normal")
+            if hasattr(self, 'sync_btn'):
+                self.sync_btn.config_state("normal")
+            if hasattr(self, 'migrate_btn'):
+                self.migrate_btn.config_state("normal")
 
     def on_error_safe(self, message):
         """Thread-safe error handling."""
@@ -638,13 +647,17 @@ class DownloaderTab(tk.Frame):
         if not hasattr(self, 's3_settings_frame'):
             return
             
-        if self.storage_type_var.get() == "s3":
+        storage_type = self.storage_type_var.get()
+        
+        if storage_type == "s3":
+            # Ensure it is at the bottom of the body frame in the card
             self.s3_settings_frame.pack(fill="x", padx=12, pady=(0, 12))
         else:
             self.s3_settings_frame.pack_forget()
             
         # Force settings card to resize
         if hasattr(self, 'settings_card'):
+            self.settings_card.update_idletasks()
             self.after(50, lambda: self.settings_card._adjust_size())
 
     def update_accordion_summaries(self, *args):
@@ -1166,6 +1179,86 @@ class DownloaderTab(tk.Frame):
                          args=(local_dir, s3_config), 
                          kwargs={"remove_local": should_delete},
                          daemon=True).start()
+
+    def start_s3_sync_thread(self):
+        """Start the full S3 inventory sync process in a separate thread."""
+        # Ensure config is saved first
+        self.save_config()
+        
+        # Confirm with user
+        msg = ("This will scan your entire Suno library and match it against files in S3 to rebuild your database and manifest.\n\n"
+               "This can take several minutes for large libraries. Do you want to continue?")
+        if not messagebox.askyesno("Confirm Full Sync", msg, parent=self):
+            return
+
+        # Option for clean rebuild
+        should_clear = messagebox.askyesno(
+            "Clean Rebuild?", 
+            "Do you want to CLEAR the local Nexus database before starting?\n\n"
+            "YES: Rebuild from scratch (Slower, ensures 100% integrity)\n"
+            "NO: Update existing (Faster, only adds missing metadata)",
+            parent=self
+        )
+
+        self.toggle_action_buttons(downloading=True) # Lock buttons
+        self.update_status_safe("S3 Full Sync...")
+        self.progress.start(10)
+        self.progress.set_text("Syncing S3...")
+        
+        # Connect log signal specifically for sync if not already connected
+        # Note: downloader.signals are usually connected in start_download_thread
+        # but we need them here too.
+        try:
+            self.downloader.signals.log_message.connect(self.log_safe)
+        except:
+            pass
+
+        threading.Thread(target=self._run_s3_sync_logic, args=(should_clear,), daemon=True).start()
+
+    def _run_s3_sync_logic(self, should_clear=False):
+        """Execute the S3 sync logic from the dedicated script."""
+        from datetime import datetime
+        
+        def log_to_ui(msg, mtype="info"):
+            try:
+                # Normalize log level for downloader UI
+                ui_type = mtype
+                if mtype == "success": ui_type = "info"
+                
+                # Signal expects (str, str)
+                self.downloader.signals.log_message.emit(msg, ui_type)
+                
+                # Also update status bar with the message
+                self.update_status_safe(msg[:40] + "..." if len(msg) > 40 else msg)
+            except Exception as e:
+                print(f"DEBUG: log_to_ui failure: {e}")
+
+        log_to_ui("Initiating background sync thread...", "info")
+        try:
+            # Import inside try block to catch potential dependency/syntax errors
+            from sync_s3_inventory import run_integrity_sync
+            success = run_integrity_sync(config_mgr=self.config_manager, log_callback=log_to_ui, clear_db=should_clear)
+            
+            if success:
+                # Update last sync timestamp
+                now = datetime.now().strftime("%Y-%m-%d %H:%M")
+                self.last_full_sync_var.set(now)
+                self.config_manager.set("last_full_sync", now)
+                self.config_manager.save_config()
+                log_to_ui(f"Full Sync Completed successfully at {now}", "success")
+            else:
+                log_to_ui("Full Sync failed to complete fully.", "error")
+                
+        except Exception as e:
+            self.downloader.signals.log_message.emit(f"Sync Error: {str(e)}", "error")
+            import traceback
+            traceback.print_exc()
+        finally:
+            # UI Cleanup on main thread
+            self.after(0, lambda: self.toggle_action_buttons(downloading=False))
+            self.after(0, lambda: self.progress.stop())
+            self.after(0, lambda: self.progress.set_text(""))
+            self.after(0, lambda: self.update_status_safe("Ready"))
 
     def check_initial_path(self):
         """Check if download path is set, if not prompt user."""

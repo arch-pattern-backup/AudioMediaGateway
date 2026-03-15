@@ -245,24 +245,6 @@ def get_unique_filename(filename):
         counter += 1
 
 
-def get_downloaded_uuids(directory):
-    uuids = set()
-    if not os.path.exists(directory):
-        return uuids
-
-    for root, dirs, files in os.walk(directory):
-        for fname in files:
-            if fname.lower().endswith(".mp3"):
-                try:
-                    audio = ID3(os.path.join(root, fname))
-                    for frame in audio.getall("TXXX"):
-                        if frame.desc == "SUNO_UUID":
-                            uuids.add(frame.text[0])
-                except:
-                    pass
-    return uuids
-
-
 class RateLimiter:
     """Simple token-style rate limiter that enforces a minimum delay between calls."""
 

@@ -10,10 +10,12 @@ import tempfile
 try:
     import boto3
     from botocore.exceptions import NoCredentialsError
+    from botocore.config import Config
 except ImportError:
     boto3 = None
 
-from suno_utils import RateLimiter, get_downloaded_uuids, embed_metadata, sanitize_filename, get_unique_filename
+from suno_utils import RateLimiter, build_uuid_cache, embed_metadata, sanitize_filename, get_unique_filename
+from db_manager import DBManager
 from mutagen.id3 import ID3
 from mutagen.wave import WAVE
 
@@ -151,7 +153,46 @@ class SunoDownloader:
         filters = self.config.get("filter_settings", {})
         
         headers = {"Authorization": f"Bearer {token}"}
-        existing_uuids = get_downloaded_uuids(directory)
+        
+        # --- CACHE INITIALIZATION ---
+        self._log("Building cache of existing songs...", "info")
+        existing_uuids = build_uuid_cache(directory)
+        
+        # Initialize SQLite DB
+        db_path = os.path.join(directory, "sunosync.db")
+        self.db = DBManager(db_path)
+        
+        is_s3 = self.config.get("storage_type") == "s3"
+        s3_keys = set()
+        s3_client = None
+        s3_conf = self.config.get("s3_config", {})
+        
+        if is_s3:
+            s3_keys = self._list_s3_keys()
+            self._log(f"Found {len(s3_keys)} objects in S3 bucket.", "info")
+            
+            # Sync S3 keys to database
+            self.db.bulk_upsert_s3_keys(s3_keys, s3_conf.get("bucket", ""))
+            
+            # Create a reusable S3 client with robust config
+            try:
+                s3_robust_config = Config(
+                    signature_version='s3v4',
+                    retries={'max_attempts': 10, 'mode': 'standard'},
+                    connect_timeout=15,
+                    read_timeout=60
+                )
+                s3_client = boto3.client(
+                    's3',
+                    endpoint_url=s3_conf.get('endpoint'),
+                    aws_access_key_id=s3_conf.get('access_key'),
+                    aws_secret_access_key=s3_conf.get('secret_key'),
+                    config=s3_robust_config
+                )
+            except:
+                pass
+
+        self._log(f"Found {len(existing_uuids)} existing songs in local cache.", "info")
 
         # Mode 1: Download Specific Songs (from Preload)
         if target_songs:
@@ -171,6 +212,7 @@ class SunoDownloader:
                             token,
                             existing_uuids,
                             self.rate_limiter,
+                            s3_client
                         )
                     )
                 
@@ -191,14 +233,16 @@ class SunoDownloader:
                 self.signals.status_changed.emit("Stopped")
             else:
                 self.signals.status_changed.emit("Complete")
+            
+            # Final Manifest Export (Mode 1)
+            self._generate_and_upload_manifest(directory, s3_client, s3_conf)
+            
             self.signals.download_complete.emit(True)
             return
 
         # Mode 2: Scan/Download from Feed/Workspace
         self.signals.status_changed.emit("Scanning...")
-        self.signals.status_changed.emit("Scanning...")
-        self._log(f"Scanning local cache directory: {directory}...", "info")
-        self._log(f"Found {len(existing_uuids)} existing songs in local cache.", "info")
+        # (Rest of URL Selection Logic)
 
         # --- URL Selection Logic ---
         workspace_id = filters.get("workspace_id")
@@ -257,19 +301,8 @@ class SunoDownloader:
             self.signals.status_changed.emit("Fetching List...")
             self._log("Fetching song list...", "info")
             
-            # Build UUID cache from existing files for duplicate detection
-            self._log("Building UUID cache from existing files...", "info")
-            from suno_utils import build_uuid_cache
-            uuid_cache = build_uuid_cache(directory)
-            self._log(f"Found {len(uuid_cache)} existing songs in cache.", "info")
-            
-            consecutive_skipped_pages = 0
-            # Adaptive threshold: scale with library size
-            # For small libraries (< 100 songs): 2 pages
-            # For medium libraries (100-1000 songs): 5 pages  
-            # For large libraries (1000-5000 songs): 10 pages
-            # For very large libraries (> 5000 songs): 20 pages
-            library_size = len(uuid_cache)
+            # Smart Resume Thresholding
+            library_size = len(existing_uuids)
             if library_size < 100:
                 smart_resume_threshold = 2
             elif library_size < 1000:
@@ -279,7 +312,7 @@ class SunoDownloader:
             else:
                 smart_resume_threshold = 20
             
-            # Track if we've found ANY new songs yet (to avoid stopping on initial already-downloaded pages)
+            # Track if we've found ANY new songs yet
             found_new_songs = False
             
             if self.config.get("smart_resume"):
@@ -536,10 +569,25 @@ class SunoDownloader:
                         # Extract UUID
                         uuid = song_data.get("id")
 
-                        # 9. Duplicate Check (Metadata-Based)
-                        if uuid and uuid in uuid_cache:
-                            self._log(f"Skipping {title} (UUID found in cache)", "info")
+                        # 9. Duplicate Check (Local Cache)
+                        if uuid and uuid in existing_uuids:
+                            self._log(f"Skipping {title} (UUID found in local cache)", "info")
                             continue
+                            
+                        # 10. S3 Duplicate Check (Key-Based)
+                        if is_s3:
+                            found_on_s3 = False
+                            # Check for common extensions
+                            for ext in [".mp3", ".wav"]:
+                                expected_key = self._get_expected_s3_key(song_data, ext)
+                                if expected_key in s3_keys:
+                                    found_on_s3 = True
+                                    break
+                            
+                            if found_on_s3:
+                                self._log(f"Skipping {title} (found on S3: {expected_key})", "info")
+                                if uuid: existing_uuids.add(uuid)
+                                continue
 
                         # E. SUCCESS
                         filtered_clips.append(song_data)
@@ -553,17 +601,13 @@ class SunoDownloader:
                         found_new_songs = True
                         consecutive_skipped_pages = 0  # Reset counter when we find new songs
                     else:
-                        # Only count skipped pages if we've already found some new songs
-                        # This prevents stopping on initial pages of already-downloaded content
-                        if found_new_songs:
-                            consecutive_skipped_pages += 1
-                        # If we haven't found any new songs yet, don't count skipped pages
-                        # This allows scanning through already-downloaded pages at the start
+                        # Increment skipped counter every time a page is empty
+                        consecutive_skipped_pages += 1
                          
-                    # Smart Resume: Only stop if we've found new songs before, then hit threshold
-                    # This ensures we scan past initial already-downloaded pages
-                    if self.config.get("smart_resume") and found_new_songs and consecutive_skipped_pages >= smart_resume_threshold:
-                        self._log(f"Smart Resume: Found new songs earlier, but no new songs in last {smart_resume_threshold} consecutive pages. Stopping scan.", "success")
+                    # Smart Resume: Stop if we've seen too many empty pages
+                    # Note: We removed 'found_new_songs' check to allow stopping even if EVERYTHING is old
+                    if self.config.get("smart_resume") and consecutive_skipped_pages >= smart_resume_threshold:
+                        self._log(f"Smart Resume: {consecutive_skipped_pages} consecutive pages with no new songs. Library appears up-to-date. Stopping.", "success")
                         success = True
                         break
                     
@@ -584,6 +628,7 @@ class SunoDownloader:
                                     token,
                                     existing_uuids,
                                     self.rate_limiter,
+                                    s3_client
                                 )
                             )
 
@@ -619,6 +664,9 @@ class SunoDownloader:
         else:
             self.signals.status_changed.emit("Error")
             
+        # Final Manifest Export (Mode 2)
+        self._generate_and_upload_manifest(directory, s3_client, s3_conf)
+
         self.signals.download_complete.emit(success)
 
     def fetch_workspaces(self, token):
@@ -695,7 +743,127 @@ class SunoDownloader:
         
         return all_playlists
 
-    def download_single_song(self, clip, directory, headers, token, existing_uuids, rate_limiter):
+    def _list_s3_keys(self):
+        """Fetch all object keys from the configured S3 bucket with robust retry logic."""
+        s3_conf = self.config.get("s3_config", {})
+        if not boto3 or not s3_conf.get("bucket"):
+            return set()
+
+        # Robust config for long-running listings or unstable port-forwards
+        s3_robust_config = Config(
+            region_name=s3_conf.get("region", "us-east-1"),
+            signature_version='s3v4',
+            retries={'max_attempts': 10, 'mode': 'standard'},
+            connect_timeout=30,
+            read_timeout=300 # 5 minutes for very large buckets
+        )
+
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                s3_client = boto3.client(
+                    "s3",
+                    endpoint_url=s3_conf.get("endpoint"),
+                    aws_access_key_id=s3_conf.get("access_key"),
+                    aws_secret_access_key=s3_conf.get("secret_key"),
+                    config=s3_robust_config
+                )
+                
+                keys = set()
+                paginator = s3_client.get_paginator("list_objects_v2")
+                pages = paginator.paginate(Bucket=s3_conf.get("bucket"), Prefix=s3_conf.get("prefix", ""))
+                
+                for page in pages:
+                    if "Contents" in page:
+                        for obj in page["Contents"]:
+                            keys.add(obj["Key"])
+                return keys
+            except Exception as e:
+                self._log(f"S3 Listing Attempt {attempt+1} failed: {e}", "warning")
+                if attempt < max_retries - 1:
+                    time.sleep(5) # Wait for port-forward to recover
+                else:
+                    self._log(f"Failed to list S3 objects after {max_retries} attempts.", "error")
+                    return set()
+
+    def _get_expected_s3_key(self, song_data, extension):
+        """Calculate the expected S3 key for a given song clip and extension."""
+        s3_conf = self.config.get("s3_config", {})
+        prefix = s3_conf.get("prefix", "")
+        
+        title = song_data.get("title", "") or song_data.get("id")
+        created_at = song_data.get("created_at", "")
+        
+        # Determine relative path based on organization settings
+        rel_path_parts = []
+        if self.config.get("organize_by_month") and created_at:
+            rel_path_parts.append(created_at[:7])
+            
+        if self.config.get("organize_by_track") and self._is_stem(song_data):
+            base_title = self._get_base_title(title)
+            safe_title = sanitize_filename(base_title)
+            rel_path_parts.append(safe_title)
+            
+        # Extension is already sanitized in resolve_audio_stream, but we provide it here
+        fname = sanitize_filename(title) + extension
+        
+        # Build the full S3 key
+        key_parts = []
+        if prefix:
+            # Clean prefix (remove leading/trailing slashes)
+            clean_prefix = prefix.strip("/")
+            if clean_prefix:
+                key_parts.append(clean_prefix)
+                
+        for part in rel_path_parts:
+            # S3 keys use forward slashes even on Windows
+            key_parts.append(part.replace(os.path.sep, "/"))
+            
+        key_parts.append(fname)
+        
+        # Join and ensure no double slashes
+        return "/".join(key_parts).replace("//", "/")
+
+    def _generate_and_upload_manifest(self, directory, s3_client, s3_conf):
+        """Generate JSON manifest and upload to S3 if enabled."""
+        if not hasattr(self, 'db'):
+            return
+
+        try:
+            self._log("Generating S3 Inventory Manifest...", "info")
+            json_path = os.path.join(directory, "s3_inventory.json")
+            self.db.export_json(json_path, s3_conf.get("bucket", ""))
+            
+            if s3_client and s3_conf.get("bucket"):
+                bucket = s3_conf.get("bucket")
+                
+                # Re-initialize client with robust config for the final upload if it's missing or to be safe
+                s3_robust_config = Config(
+                    signature_version='s3v4',
+                    retries={'max_attempts': 10, 'mode': 'standard'},
+                    connect_timeout=15,
+                    read_timeout=60
+                )
+                s3_upload_client = boto3.client(
+                    's3',
+                    endpoint_url=s3_conf.get('endpoint'),
+                    aws_access_key_id=s3_conf.get('access_key'),
+                    aws_secret_access_key=s3_conf.get('secret_key'),
+                    config=s3_robust_config
+                )
+
+                prefix = s3_conf.get("prefix", "")
+                manifest_key = "s3_inventory.json"
+                if prefix:
+                    manifest_key = f"{prefix.strip('/')}/s3_inventory.json"
+                
+                self._log(f"Uploading manifest to S3: {manifest_key}...", "info")
+                s3_upload_client.upload_file(json_path, bucket, manifest_key)
+                self._log("Manifest sync complete.", "success")
+        except Exception as e:
+            self._log(f"Manifest generation error: {e}", "warning")
+
+    def download_single_song(self, clip, directory, headers, token, existing_uuids, rate_limiter, s3_client=None):
         if self.is_stopped():
             return
 
@@ -798,16 +966,23 @@ class SunoDownloader:
                 s3_key_parts.append(fname)
                 s3_key = "/".join(s3_key_parts).replace("//", "/")
 
-                if not boto3:
-                    raise ImportError("boto3 is not installed")
+                if not s3_client:
+                    if not boto3:
+                        raise ImportError("boto3 is not installed")
 
-                s3_client = boto3.client(
-                    's3',
-                    endpoint_url=s3_conf.get('endpoint'),
-                    aws_access_key_id=s3_conf.get('access_key'),
-                    aws_secret_access_key=s3_conf.get('secret_key'),
-                    region_name=s3_conf.get('region')
-                )
+                    s3_robust_config = Config(
+                        signature_version='s3v4',
+                        retries={'max_attempts': 10, 'mode': 'standard'},
+                        connect_timeout=15,
+                        read_timeout=60
+                    )
+                    s3_client = boto3.client(
+                        's3',
+                        endpoint_url=s3_conf.get('endpoint'),
+                        aws_access_key_id=s3_conf.get('access_key'),
+                        aws_secret_access_key=s3_conf.get('secret_key'),
+                        config=s3_robust_config
+                    )
                 bucket = s3_conf.get('bucket')
 
                 try:
@@ -893,15 +1068,22 @@ class SunoDownloader:
         # S3 Upload Phase
         if download_success and is_s3:
             try:
-                if 's3_client' not in locals() or s3_client is None:
+                if not s3_client:
                     if not boto3:
                         raise ImportError("boto3 is not installed")
+                    
+                    s3_robust_config = Config(
+                        signature_version='s3v4',
+                        retries={'max_attempts': 10, 'mode': 'standard'},
+                        connect_timeout=15,
+                        read_timeout=60
+                    )
                     s3_client = boto3.client(
                         's3',
                         endpoint_url=s3_conf.get('endpoint'),
                         aws_access_key_id=s3_conf.get('access_key'),
                         aws_secret_access_key=s3_conf.get('secret_key'),
-                        region_name=s3_conf.get('region')
+                        config=s3_robust_config
                     )
 
                 bucket = s3_conf.get('bucket')
@@ -922,7 +1104,11 @@ class SunoDownloader:
                 self.signals.song_updated.emit(uuid, "Uploading to S3", 100)
                 self._log(f"Uploading to S3: {title}...", "info")
                 
-                s3_client.upload_file(out_path, bucket, s3_key)
+                # Upload with metadata
+                s3_client.upload_file(
+                    out_path, bucket, s3_key,
+                    ExtraArgs={'Metadata': {'suno_uuid': str(uuid)}}
+                )
                 self._log(f"Uploaded to {bucket}/{s3_key}", "success")
                 
             except Exception as e:
@@ -938,6 +1124,10 @@ class SunoDownloader:
         # Lyrics saving
         if lyrics and self.config.get("save_lyrics", True):
             try:
+                # Ensure lyrics are in the metadata dict for DB/JSON export
+                if "metadata" not in clip: clip["metadata"] = {}
+                clip["metadata"]["lyrics_sync"] = lyrics 
+                
                 if is_s3 and download_success:
                     s3_parts = s3_key.split(".")
                     # Simply add .txt extension to the key, replacing audio ext if possible or appending
@@ -961,6 +1151,16 @@ class SunoDownloader:
 
         if download_success:
             final_path = out_path if not is_s3 else f"s3://{s3_conf.get('bucket')}/{s3_key}"
+            
+            # --- DATABASE UPDATE ---
+            try:
+                clip["s3_key"] = s3_key if is_s3 else None
+                clip["local_path"] = out_path if not is_s3 else None
+                if hasattr(self, 'db'):
+                    self.db.upsert_song(clip)
+            except Exception as e:
+                self._log(f"Database update error for {title}: {e}", "warning")
+            
             existing_uuids.add(uuid)
             self._log(f"✓ {title}", "success", thumbnail_data=thumb_data)
             self.signals.song_finished.emit(uuid, True, final_path)

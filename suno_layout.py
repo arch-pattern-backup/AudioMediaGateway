@@ -128,9 +128,24 @@ def create_settings_card(parent, app, base_path):
     create_radio(storage_row, "Local Folder", "local", app.storage_type_var)
     create_radio(storage_row, "S3 / MinIO", "s3", app.storage_type_var)
     
+    # --- ADDED: Sync Button and Label next to Storage Type ---
+    app.sync_btn = RoundedButton(storage_row, "Full Sync", app.start_s3_sync_thread,
+                               bg_color=app.accent_purple, fg_color="white",
+                               hover_color=app.bg_dark, font=("Segoe UI", 8, "bold"),
+                               width=100, height=28, corner_radius=6, border_color=app.border_subtle)
+    app.sync_btn.pack(side=tk.LEFT, padx=(5, 0))
+    app.create_tooltip(app.sync_btn, "Full S3 Inventory Sync (Authoritative Rebuild)")
+
+    app.sync_label_frame = tk.Frame(storage_row, bg=app.bg_card)
+    app.sync_label_frame.pack(side=tk.LEFT, padx=10)
+    tk.Label(app.sync_label_frame, text="Last Sync:", font=("Segoe UI", 7), bg=app.bg_card, fg=app.fg_secondary).pack(anchor="w")
+    tk.Label(app.sync_label_frame, textvariable=app.last_full_sync_var, font=("Segoe UI", 7, "bold"), bg=app.bg_card, fg=app.fg_primary).pack(anchor="w")
+
     # S3 Settings Container
     app.s3_settings_frame = tk.Frame(body, bg=app.bg_card)
-    app.s3_settings_frame.pack(fill="x", padx=12, pady=(0, 12))
+    # Default packed if S3 is selected
+    if app.storage_type_var.get() == "s3":
+        app.s3_settings_frame.pack(fill="x", padx=12, pady=(0, 12))
     
     # Grid for S3 inputs
     s3_grid = tk.Frame(app.s3_settings_frame, bg=app.bg_card)
@@ -164,10 +179,11 @@ def create_settings_card(parent, app, base_path):
     migrate_row = tk.Frame(app.s3_settings_frame, bg=app.bg_card)
     migrate_row.pack(fill="x", pady=(12, 0))
     
-    migrate_btn = RoundedButton(migrate_row, "Migrate Local Files to S3", app.start_migration_thread,
+    migrate_btn = RoundedButton(migrate_row, "Migrate Local to S3", app.start_migration_thread,
                                 bg_color=app.bg_input, fg_color=app.accent_purple,
                                 hover_color=app.bg_dark, font=("Segoe UI", 9, "bold"),
-                                width=200, height=32, corner_radius=8, border_color=app.border_subtle)
+                                width=160, height=32, corner_radius=8, border_color=app.border_subtle)
+    app.migrate_btn = migrate_btn
     migrate_btn.pack(side=tk.RIGHT)
     app.create_tooltip(migrate_btn, "Scan local folder and upload all files to the configured S3 bucket")
 

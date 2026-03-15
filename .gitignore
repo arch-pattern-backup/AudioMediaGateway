@@ -58,6 +58,11 @@ dist/
 *.exe
 *.zip
 
+# Nexus Data Files
+sunosync.db
+s3_inventory.json
+s3_inventory_latest.json
+
 # Temporary files
 temp_*.html
 *.tmp
