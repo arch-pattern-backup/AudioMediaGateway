@@ -224,7 +224,6 @@ class SunoDownloader:
                     try:
                         future.result()
                     except Exception as e:
-                        import traceback
                         error_msg = f"Download error: {str(e)}\n{traceback.format_exc()}"
                         self._log(error_msg, "error")
                         print(error_msg)  # Also print for debug log
@@ -314,6 +313,7 @@ class SunoDownloader:
             
             # Track if we've found ANY new songs yet
             found_new_songs = False
+            consecutive_skipped_pages = 0
             
             if self.config.get("smart_resume"):
                 self._log(f"Smart Resume: Will stop after {smart_resume_threshold} consecutive pages with no new songs (library size: {library_size} songs).", "info")
@@ -337,6 +337,12 @@ class SunoDownloader:
                             # Increased timeout to 30s and added retry loop
                             r = requests.get(url, headers=headers, timeout=30)
                             
+                            if r.status_code == 429:
+                                attempt_backoff = min(60, (2 ** attempt) + 10)
+                                self._log(f"Rate limited (429) on page {page_num}. Waiting {attempt_backoff}s...", "warning")
+                                time.sleep(attempt_backoff)
+                                continue
+
                             # 404 Fallback Logic: Project -> Playlist
                             if r.status_code == 404:
                                 if "/api/project/" in base_url:
@@ -349,9 +355,9 @@ class SunoDownloader:
                                     base_url = re.sub(r"[?&]page=$", "", base_url)
                                     continue # Retry immediately with new URL
                                 else:
-                                    self._log("Error: Resource not found (404).", "error")
-                                    success = False
-                                    break
+                                    self._log(f"Reached end of library (404) at page {page_num}.", "info")
+                                    success = True
+                                    break # Break retry loop
 
                             if r.status_code == 401:
                                 self._log("Error: Token expired.", "error")
@@ -603,11 +609,13 @@ class SunoDownloader:
                     else:
                         # Increment skipped counter every time a page is empty
                         consecutive_skipped_pages += 1
+                        if self.config.get("smart_resume"):
+                            self._log(f"Smart Resume: {consecutive_skipped_pages}/{smart_resume_threshold} consecutive pages with no new songs.", "info")
                          
                     # Smart Resume: Stop if we've seen too many empty pages
                     # Note: We removed 'found_new_songs' check to allow stopping even if EVERYTHING is old
                     if self.config.get("smart_resume") and consecutive_skipped_pages >= smart_resume_threshold:
-                        self._log(f"Smart Resume: {consecutive_skipped_pages} consecutive pages with no new songs. Library appears up-to-date. Stopping.", "success")
+                        self._log(f"Smart Resume: Threshold reached ({smart_resume_threshold} pages). Library appears up-to-date. Finishing.", "success")
                         success = True
                         break
                     
@@ -649,6 +657,11 @@ class SunoDownloader:
                     if self.is_stopped():
                         break
                     
+                    # SAFETY: If we hit page 1000, something is wrong
+                    if page_num > 1000:
+                        self._log("Safety break: Reached page 1000. Potential infinite loop or massive library. Stopping.", "warning")
+                        break
+
                     page_num += 1
                     time.sleep(1)
         except Exception as exc:

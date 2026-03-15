@@ -266,12 +266,14 @@ class LibraryTab(tk.Frame):
             s3_secret_key = self.config_manager.get("s3_secret_key", "")
             
             session = boto3.session.Session()
+            from botocore.client import Config
             return session.client(
                 's3',
                 endpoint_url=s3_endpoint,
                 aws_access_key_id=s3_access_key,
                 aws_secret_access_key=s3_secret_key,
-                region_name='us-east-1'
+                region_name='us-east-1',
+                config=Config(s3={'addressing_style': 'path'})
             )
         except Exception as e:
             print(f"Failed to create S3 client: {e}")
@@ -345,7 +347,26 @@ class LibraryTab(tk.Frame):
             return ""
 
     def _load_cache(self):
-        """Load metadata cache from file."""
+        """Load metadata cache from file, prioritizing the Nexus inventory."""
+        # Try Nexus Inventory first if it exists in the download folder
+        nexus_path = os.path.join(self.download_path, "s3_inventory.json")
+        if os.path.exists(nexus_path):
+            try:
+                print(f"DEBUG: Loading authoritative Nexus Inventory from {nexus_path}")
+                with open(nexus_path, 'r', encoding='utf-8') as f:
+                    inventory = json.load(f)
+                    # Convert Nexus format to legacy cache format if needed
+                    # Nexus: {"items": {"uuid": {"title": ...}}}
+                    # Legacy: {"uuid": {"title": ...}}
+                    if "items" in inventory:
+                        self.cache = inventory["items"]
+                    else:
+                        self.cache = inventory
+                return
+            except Exception as e:
+                print(f"Error loading Nexus inventory: {e}")
+
+        # Fallback to standard library cache
         if self.cache_file and os.path.exists(self.cache_file):
             try:
                 with open(self.cache_file, 'r', encoding='utf-8') as f:
@@ -635,12 +656,25 @@ class LibraryTab(tk.Frame):
                     filename = os.path.basename(key)
                     title = filename
                     artist = "Unknown"
-                    # Try to find in our list to get better metadata
-                    for song in self.filtered_songs:
-                         if song['id'] == key:
-                             title = song['title']
-                             artist = song['artist']
-                             break
+                    
+                    # Try to find in our cache to get better metadata
+                    # Cache might be keyed by UUID or full S3 URL
+                    cached_data = None
+                    
+                    # Search by UUID (if key contains it)
+                    import re
+                    uuid_match = re.search(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', key, re.I)
+                    if uuid_match:
+                        uuid = uuid_match.group(0).lower()
+                        cached_data = self.cache.get(uuid)
+                    
+                    # Search by full key if not found by UUID
+                    if not cached_data:
+                        cached_data = self.cache.get(filepath)
+                    
+                    if cached_data:
+                        title = cached_data.get('title', title)
+                        artist = cached_data.get('artist', artist)
                     
                     print(f"DEBUG: Playing S3 URL: {url}")
                     self.player_widget.play_file(url)

@@ -85,9 +85,64 @@ else:
 import time
 import json
 import random
+import math
 from threading import Thread
 from suno_utils import open_file
 
+class AudioVisualizer(tk.Canvas):
+    def __init__(self, parent, **kwargs):
+        super().__init__(parent, highlightthickness=0, **kwargs)
+        self.bars = 32
+        self.bar_data = [0] * self.bars
+        self.target_data = [0] * self.bars
+        self.is_active = False
+        self.accent_color = "#8b5cf6"
+        self.after(50, self._update_viz)
+
+    def set_active(self, active):
+        self.is_active = active
+
+    def _update_viz(self):
+        if self.is_active:
+            # Generate pseudo-spectral data for visual interest
+            # In a full implementation, we'd pull FFT data from VLC
+            for i in range(self.bars):
+                # Simulated movement
+                change = random.randint(-20, 20)
+                self.target_data[i] = max(5, min(80, self.target_data[i] + change))
+                # Smooth interpolation
+                self.bar_data[i] += (self.target_data[i] - self.bar_data[i]) * 0.3
+        else:
+            # Smoothly drop bars to zero
+            for i in range(self.bars):
+                self.bar_data[i] *= 0.8
+                if self.bar_data[i] < 1: self.bar_data[i] = 0
+
+        self.draw()
+        self.after(40, self._update_viz)
+
+    def draw(self):
+        self.delete("all")
+        w = self.winfo_width()
+        h = self.winfo_height()
+        if w < 10: return
+
+        bar_w = w / self.bars
+        for i in range(self.bars):
+            val = self.bar_data[i]
+            # Draw symmetrical bars from center
+            bar_h = (val / 100) * h
+            x0 = i * bar_w + 2
+            y0 = h - bar_h
+            x1 = (i + 1) * bar_w - 2
+            y1 = h
+            
+            # Gradient effect
+            alpha = int((val / 100) * 255)
+            self.create_rectangle(x0, y0, x1, y1, fill=self.accent_color, outline="", tags="bar")
+            
+            # Top cap
+            self.create_rectangle(x0, y0, x1, y0+2, fill="#a78bfa", outline="")
 
 class PlayerWidget(tk.Frame):
     """Audio player widget with playback controls."""
@@ -102,7 +157,16 @@ class PlayerWidget(tk.Frame):
         if VLC_AVAILABLE:
             try:
                 print("DEBUG: Attempting to initialize VLC instance...")
-                self.instance = vlc.Instance('--no-xlib')  # Headless mode
+                # Add network-related flags for S3/MinIO streaming
+                # --no-xlib: Headless mode
+                # --network-caching: Buffer for unstable connections
+                # --http-referrer: Some S3 setups might need this
+                vlc_args = [
+                    '--no-xlib',
+                    '--network-caching=3000', # 3s buffer
+                    '--no-video' # Audio only
+                ]
+                self.instance = vlc.Instance(*vlc_args)
                 print(f"DEBUG: VLC Instance created: {self.instance}")
                 
                 if self.instance is None:
@@ -213,7 +277,11 @@ class PlayerWidget(tk.Frame):
         
         # Controls (Buttons)
         controls_frame = tk.Frame(center_frame, bg=self.bg_card)
-        controls_frame.pack(side=tk.TOP, pady=(10, 5))
+        controls_frame.pack(side=tk.TOP, pady=(5, 2))
+        
+        # --- VISUALIZER ---
+        self.visualizer = AudioVisualizer(center_frame, bg=self.bg_card, height=40)
+        self.visualizer.pack(fill="x", padx=40, pady=(0, 5))
         
         btn_style = {
             "bg": self.bg_dark,
@@ -465,9 +533,15 @@ class PlayerWidget(tk.Frame):
                 btn.config(bg=self.bg_dark, fg=self.fg_primary)
 
     def play_file(self, filepath):
-        """Play a specific file."""
-        # Normalize filepath FIRST before any operations
-        filepath = os.path.normpath(filepath)
+        """Play a specific file or URL."""
+        if not filepath:
+            return False
+            
+        is_url = filepath.lower().startswith(('http://', 'https://', 's3://'))
+        
+        # Normalize ONLY if it's a local file path
+        if not is_url:
+            filepath = os.path.normpath(filepath)
         
         if not VLC_AVAILABLE:
             import tkinter.messagebox as messagebox
@@ -479,14 +553,12 @@ class PlayerWidget(tk.Frame):
             messagebox.showerror("Player Error", "VLC player failed to initialize.")
             return False
         
-        is_url = filepath.lower().startswith(('http://', 'https://', 's3://'))
-        
         if not is_url and not os.path.exists(filepath):
             import tkinter.messagebox as messagebox
             messagebox.showerror("File Not Found", f"File does not exist:\n{filepath}")
             return False
         
-        # Set current_file with normalized path
+        # Set current_file
         self.current_file = filepath
 
         try:
@@ -494,8 +566,14 @@ class PlayerWidget(tk.Frame):
             if self.is_playing:
                 self.player.stop()
             
-            # Load media
-            media = self.instance.media_new(filepath)
+            # Load media - use media_new_location for URLs
+            if is_url:
+                print(f"DEBUG: Loading media location: {filepath}")
+                media = self.instance.media_new_location(filepath)
+            else:
+                print(f"DEBUG: Loading media file: {filepath}")
+                media = self.instance.media_new_path(filepath)
+                
             if not media:
                 import tkinter.messagebox as messagebox
                 messagebox.showerror("Media Error", f"Failed to load media from:\n{filepath}")
@@ -511,6 +589,7 @@ class PlayerWidget(tk.Frame):
                 return False
             
             self.is_playing = True
+            self.visualizer.set_active(True)
             self.play_btn.config(text="⏸")
             
             # Wait for media to parse (with timeout)
@@ -550,10 +629,12 @@ class PlayerWidget(tk.Frame):
         if self.is_playing:
             self.player.pause()
             self.is_playing = False
+            self.visualizer.set_active(False)
             self.play_btn.config(text="▶")
         else:
             self.player.play()
             self.is_playing = True
+            self.visualizer.set_active(True)
             self.play_btn.config(text="⏸")
     
     def stop(self):
@@ -562,6 +643,7 @@ class PlayerWidget(tk.Frame):
 
         self.player.stop()
         self.is_playing = False
+        self.visualizer.set_active(False)
         self.play_btn.config(text="▶")
         self.seek_var.set(0)
         self.time_label.config(text="0:00")
@@ -673,6 +755,7 @@ class PlayerWidget(tk.Frame):
                 state = self.player.get_state()
                 if state == vlc.State.Ended:
                     self.is_playing = False
+                    self.visualizer.set_active(False)
                     self.play_btn.config(text="▶")
                     self.next_song()  # Auto-play next
             except Exception:
