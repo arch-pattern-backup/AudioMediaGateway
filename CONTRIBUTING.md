@@ -1,6 +1,6 @@
-# Contributing to SunoSync
+# Contributing to Audio Media Gateway
 
-Thank you for your interest in contributing to SunoSync! 🎉
+Thank you for your interest in contributing to🎉
 
 ## How to Contribute
 
